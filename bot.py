@@ -129,19 +129,44 @@ else:
 # plain datacenter HTTP fingerprints with 403 errors. Legitimate technique:
 # it only makes requests look like a regular Chrome browser. No DRM,
 # paywall or login bypass involved.
-try:
-    import curl_cffi  # noqa: F401
-    HAS_IMPERSONATE = True
-except ImportError:
-    HAS_IMPERSONATE = False
-    logger.warning("curl_cffi not installed; browser impersonation disabled.")
-
-
-def _client_opts() -> dict:
-    """Extra yt-dlp opts so requests look like a regular browser."""
-    if HAS_IMPERSONATE:
-        return {"impersonate": "chrome"}
+# NOTE: yt-dlp versions disagree on the accepted 'impersonate' form
+# (string vs ImpersonateTarget object), so we probe at startup and use
+# whatever this install accepts — or nothing at all.
+def _detect_impersonate_opt() -> dict:
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        logger.warning("curl_cffi not installed; browser impersonation disabled.")
+        return {}
+    candidates: list = []
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        from_str = getattr(ImpersonateTarget, "from_str", None)
+        if callable(from_str):
+            try:
+                candidates.append(from_str("chrome"))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            candidates.append(ImpersonateTarget("chrome", None, None, None))
+        except Exception:  # noqa: BLE001
+            pass
+    except ImportError:
+        pass
+    candidates.append("chrome")
+    for target in candidates:
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "impersonate": target}):
+                pass
+            logger.info("Browser impersonation enabled.")
+            return {"impersonate": target}
+        except Exception:  # noqa: BLE001 - try next form
+            continue
+    logger.warning("Browser impersonation unavailable in this yt-dlp version; continuing without it.")
     return {}
+
+
+IMPERSONATE_OPT: dict = _detect_impersonate_opt()
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +261,7 @@ def base_ydl_opts(tempdir: str, progress: dict) -> dict:
         "progress_hooks": [_hook],
         # Do NOT bypass DRM / paywalls / private content.
         "allow_unplayable_formats": False,
-        **_client_opts(),
+        **IMPERSONATE_OPT,
     }
 
 
@@ -250,7 +275,7 @@ def extract_metadata(url: str) -> dict:
         "skip_download": True,
         "retries": 2,
         "extractor_retries": 1,
-        **_client_opts(),
+        **IMPERSONATE_OPT,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
