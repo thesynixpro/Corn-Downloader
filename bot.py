@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import math
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -81,6 +83,13 @@ def _normalize_api_url(raw: str) -> str:
 TELEGRAM_API_URL = _normalize_api_url(os.environ.get("TELEGRAM_API_URL", ""))
 # Large uploads need generous timeouts regardless of REQUEST_TIMEOUT.
 UPLOAD_TIMEOUT = max(REQUEST_TIMEOUT, 600)
+# Split delivery for the cloud Bot API (~50 MB/bot-upload cap): videos that
+# fit MAX_FILE_MB but not the cloud cap are cut into parts and sent as
+# multiple messages. Only used when TELEGRAM_API_URL is NOT set.
+SPLIT_PART_MB = _int_env("SPLIT_PART_MB", 45)
+SPLIT_PART_MB = min(max(SPLIT_PART_MB, 20), 49)
+SPLIT_MAX_PARTS = _int_env("SPLIT_MAX_PARTS", 15)
+SPLIT_MAX_PARTS = min(max(SPLIT_MAX_PARTS, 2), 25)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
 if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
     LOG_LEVEL = "INFO"
@@ -441,6 +450,65 @@ def find_downloaded_file(tempdir: str) -> str | None:
     return str(max(media, key=lambda p: p.stat().st_mtime))
 
 
+class SplitError(Exception):
+    """Raised when a video cannot be split into uploadable parts."""
+
+
+def split_video(filepath: str, tempdir: str, duration_s: float | None) -> list[str]:
+    """Blocking: split a video into <=SPLIT_PART_MB parts (stream copy).
+
+    Returns sorted part paths. Runs in a thread. Raises SplitError.
+    """
+    if not shutil.which("ffmpeg"):
+        raise SplitError("FFmpeg is required for splitting.")
+    try:
+        total = os.path.getsize(filepath)
+    except OSError as exc:
+        raise SplitError("Cannot read downloaded file.") from exc
+    try:
+        duration = float(duration_s) if duration_s else 0.0
+    except (TypeError, ValueError):
+        duration = 0.0
+    if total <= 0 or duration <= 0:
+        raise SplitError("Unknown duration; cannot split.")
+    part_bytes = SPLIT_PART_MB * 1024 * 1024
+    n_parts = max(2, math.ceil(total / part_bytes))
+    if n_parts > SPLIT_MAX_PARTS:
+        raise SplitError(
+            f"Needs {n_parts} parts (limit {SPLIT_MAX_PARTS}). "
+            "Use a local Bot API server for very large files."
+        )
+    seg_time = max(10.0, duration / n_parts * 0.98)
+    outdir = tempfile.mkdtemp(prefix="parts_", dir=tempdir)
+    pattern = os.path.join(outdir, "part_%03d.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", filepath,
+        "-c", "copy", "-map", "0",
+        "-f", "segment", "-segment_time", f"{seg_time:.2f}",
+        "-reset_timestamps", "1", pattern,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SplitError("Video splitting timed out or failed.") from exc
+    if proc.returncode != 0:
+        raise SplitError("Video splitting failed.")
+    parts = sorted(
+        (str(p) for p in Path(outdir).glob("part_*.mp4") if p.stat().st_size > 0),
+    )
+    if not parts:
+        raise SplitError("Video splitting produced no parts.")
+    for p in parts:
+        if os.path.getsize(p) > CLOUD_UPLOAD_LIMIT:
+            raise SplitError(
+                "A part still exceeds Telegram's limit. "
+                "Use a local Bot API server for this file."
+            )
+    return parts
+
+
 def map_download_error(exc: BaseException) -> str:
     msg = str(exc).lower()
     if isinstance(exc, UnsupportedError) or "unsupported url" in msg:
@@ -559,13 +627,20 @@ async def run_download_job(
 
         fits, smallest = has_format_within_limit(info)
         if not fits:
-            await safe_edit(
-                status_msg,
-                f"❌ The video exceeds the configured file-size limit "
-                f"({EFFECTIVE_MAX_MB} MB; smallest known format ~{format_bytes(smallest)}).",
+            # On the cloud API the effective cap is ~50 MB, but files up to
+            # MAX_FILE_MB can still be delivered by splitting into parts.
+            if TELEGRAM_API_URL or not smallest or smallest > MAX_BYTES:
+                await safe_edit(
+                    status_msg,
+                    f"❌ The video exceeds the configured file-size limit "
+                    f"({EFFECTIVE_MAX_MB} MB; smallest known format ~{format_bytes(smallest)}).",
+                )
+                user_status[user_id] = "failed: too large"
+                return
+            logger.info(
+                "Video exceeds cloud cap for user %d (~%s); will split after download",
+                user_id, format_bytes(smallest),
             )
-            user_status[user_id] = "failed: too large"
-            return
 
         # Pin an explicit fitting rendition when possible. Without this,
         # yt-dlp's fallback chain can grab an over-limit format when sizes
@@ -608,18 +683,39 @@ async def run_download_job(
                 user_tempdir.pop(user_id, None)
             return
 
+        split_parts: list[str] = []
         if size > EFFECTIVE_MAX_BYTES:
-            logger.info("File too large for user %d: %d bytes > limit %d", user_id, size, EFFECTIVE_MAX_BYTES)
-            await safe_edit(
-                status_msg,
-                f"❌ The video exceeds the configured file-size limit "
-                f"({format_bytes(size)} > {EFFECTIVE_MAX_MB} MB).",
-            )
-            user_status[user_id] = "failed: too large"
-            cleanup_dir(tempdir)
-            async with tasks_lock:
-                user_tempdir.pop(user_id, None)
-            return
+            # Cloud API: files within MAX_FILE_MB are split into parts.
+            if not TELEGRAM_API_URL and size <= MAX_BYTES:
+                dur_s = info2.get("duration") or info.get("duration")
+                user_status[user_id] = "splitting"
+                await safe_edit(
+                    status_msg,
+                    f"✂️ Video is {format_bytes(size)} — splitting into parts for Telegram…",
+                )
+                try:
+                    split_parts = await asyncio.to_thread(split_video, filepath, tempdir, dur_s)
+                except SplitError as exc:
+                    logger.info("Split failed for user %d: %s", user_id, exc)
+                    await safe_edit(status_msg, f"❌ {exc}")
+                    user_status[user_id] = "failed: split"
+                    cleanup_dir(tempdir)
+                    async with tasks_lock:
+                        user_tempdir.pop(user_id, None)
+                    return
+                logger.info("Split %s into %d parts for user %d", format_bytes(size), len(split_parts), user_id)
+            else:
+                logger.info("File too large for user %d: %d bytes > limit %d", user_id, size, EFFECTIVE_MAX_BYTES)
+                await safe_edit(
+                    status_msg,
+                    f"❌ The video exceeds the configured file-size limit "
+                    f"({format_bytes(size)} > {EFFECTIVE_MAX_MB} MB).",
+                )
+                user_status[user_id] = "failed: too large"
+                cleanup_dir(tempdir)
+                async with tasks_lock:
+                    user_tempdir.pop(user_id, None)
+                return
 
         if size == 0:
             await safe_edit(status_msg, "❌ Unable to download this video. Please check the URL and try again.")
@@ -634,17 +730,38 @@ async def run_download_job(
 
         # Upload without loading whole file into RAM (stream from disk).
         try:
-            caption = f"🎬 {title[:900]}\n⏱ {duration} | 📦 {format_bytes(size)}"
-            with open(filepath, "rb") as fh:
-                await context.bot.send_video(
-                    chat_id=update.effective_chat.id,
-                    video=fh,
-                    caption=caption,
-                    supports_streaming=True,
-                    read_timeout=UPLOAD_TIMEOUT,
-                    write_timeout=UPLOAD_TIMEOUT,
-                    connect_timeout=30,
-                )
+            if split_parts:
+                total_parts = len(split_parts)
+                for idx, part in enumerate(split_parts, start=1):
+                    await safe_edit(
+                        status_msg,
+                        f"📤 Uploading part {idx}/{total_parts}…\n🎬 {title[:100]}",
+                    )
+                    caption = f"🎬 {title[:800]}\n⏱ {duration} | 📦 part {idx}/{total_parts}"
+                    with open(part, "rb") as fh:
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=fh,
+                            caption=caption,
+                            supports_streaming=True,
+                            read_timeout=UPLOAD_TIMEOUT,
+                            write_timeout=UPLOAD_TIMEOUT,
+                            connect_timeout=30,
+                        )
+                    if idx < total_parts:
+                        await asyncio.sleep(2)  # gentle pace: avoid flood limits
+            else:
+                caption = f"🎬 {title[:900]}\n⏱ {duration} | 📦 {format_bytes(size)}"
+                with open(filepath, "rb") as fh:
+                    await context.bot.send_video(
+                        chat_id=update.effective_chat.id,
+                        video=fh,
+                        caption=caption,
+                        supports_streaming=True,
+                        read_timeout=UPLOAD_TIMEOUT,
+                        write_timeout=UPLOAD_TIMEOUT,
+                        connect_timeout=30,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -668,7 +785,10 @@ async def run_download_job(
             return
 
         user_status[user_id] = "completed"
-        await safe_edit(status_msg, "✅ Download completed.")
+        if split_parts:
+            await safe_edit(status_msg, f"✅ Download completed ({len(split_parts)} parts).")
+        else:
+            await safe_edit(status_msg, "✅ Download completed.")
         cleanup_dir(tempdir)
         async with tasks_lock:
             user_tempdir.pop(user_id, None)
