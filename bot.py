@@ -95,6 +95,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("uvd_bot")
 
+# Silence chatty third-party loggers. Their request lines embed the full
+# Bot API URL including BOT_TOKEN — that must never land in Railway logs.
+for _noisy in ("httpx", "httpcore", "telegram", "apscheduler"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # Redact token from logs: never log BOT_TOKEN.
 # Only log its presence/absence.
 if not BOT_TOKEN:
