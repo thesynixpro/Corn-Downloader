@@ -89,6 +89,15 @@ MAX_BYTES = MAX_FILE_MB * 1024 * 1024
 # Telegram cloud Bot API accepts ~50 MB uploads from bots. Anything bigger
 # needs a self-hosted local Bot API server (TELEGRAM_API_URL).
 CLOUD_UPLOAD_LIMIT = 50 * 1024 * 1024
+# Effective deliverable limit: without a local Bot API server, picking a
+# format above ~50 MB is pointless — it downloads fine but can never upload.
+# So cap format selection AND enforcement at 50 MB on the cloud API.
+# (With TELEGRAM_API_URL set, the full MAX_FILE_MB applies.)
+if TELEGRAM_API_URL:
+    EFFECTIVE_MAX_MB = MAX_FILE_MB
+else:
+    EFFECTIVE_MAX_MB = min(MAX_FILE_MB, 50)
+EFFECTIVE_MAX_BYTES = EFFECTIVE_MAX_MB * 1024 * 1024
 URL_RE = re.compile(r"^https?://\S+\.\S+", re.IGNORECASE)
 MAX_URL_LENGTH = 2048
 
@@ -251,7 +260,7 @@ def format_duration(seconds: int | float | None) -> str:
 
 def build_format_selector() -> str:
     """Prefer MP4 combined streams inside the size limit, with fallbacks."""
-    limit = MAX_BYTES
+    limit = EFFECTIVE_MAX_BYTES
     # yt-dlp understands [filesize<123] predicates.
     return (
         f"best[ext=mp4][filesize<{limit}]/"
@@ -333,7 +342,7 @@ def extract_metadata(url: str) -> dict:
 
 
 def has_format_within_limit(info: dict) -> tuple[bool, int | None]:
-    """Check whether any usable format fits inside MAX_BYTES.
+    """Check whether any usable format fits inside EFFECTIVE_MAX_BYTES.
 
     Returns (fits, smallest_known_size_or_None).
     """
@@ -344,7 +353,7 @@ def has_format_within_limit(info: dict) -> tuple[bool, int | None]:
         if isinstance(size, (int, float)) and size > 0:
             if smallest is None or size < smallest:
                 smallest = int(size)
-            if size <= MAX_BYTES:
+            if size <= EFFECTIVE_MAX_BYTES:
                 return True, int(size)
     # Direct (non-format-list) info sometimes carries filesize.
     for key in ("filesize", "filesize_approx"):
@@ -352,7 +361,7 @@ def has_format_within_limit(info: dict) -> tuple[bool, int | None]:
         if isinstance(size, (int, float)) and size > 0:
             if smallest is None or size < smallest:
                 smallest = int(size)
-            if size <= MAX_BYTES:
+            if size <= EFFECTIVE_MAX_BYTES:
                 return True, int(size)
     if not formats and smallest is None:
         # No size info at all: cannot pre-judge; allow attempt, enforce after.
@@ -521,7 +530,7 @@ async def run_download_job(
             await safe_edit(
                 status_msg,
                 f"❌ The video exceeds the configured file-size limit "
-                f"({MAX_FILE_MB} MB; smallest known format ~{format_bytes(smallest)}).",
+                f"({EFFECTIVE_MAX_MB} MB; smallest known format ~{format_bytes(smallest)}).",
             )
             user_status[user_id] = "failed: too large"
             return
@@ -560,12 +569,12 @@ async def run_download_job(
                 user_tempdir.pop(user_id, None)
             return
 
-        if size > MAX_BYTES:
-            logger.info("File too large for user %d: %d bytes > limit %d", user_id, size, MAX_BYTES)
+        if size > EFFECTIVE_MAX_BYTES:
+            logger.info("File too large for user %d: %d bytes > limit %d", user_id, size, EFFECTIVE_MAX_BYTES)
             await safe_edit(
                 status_msg,
                 f"❌ The video exceeds the configured file-size limit "
-                f"({format_bytes(size)} > {MAX_FILE_MB} MB).",
+                f"({format_bytes(size)} > {EFFECTIVE_MAX_MB} MB).",
             )
             user_status[user_id] = "failed: too large"
             cleanup_dir(tempdir)
@@ -658,7 +667,7 @@ WELCOME = (
     "/about – features and limits\n"
     "/cancel – cancel the active download\n"
     "/status – show your download status\n\n"
-    f"Max file size: {MAX_FILE_MB} MB."
+    f"Max file size: {EFFECTIVE_MAX_MB} MB."
 )
 
 HELP_TEXT = (
@@ -678,7 +687,7 @@ ABOUT_TEXT = (
     "• Supports many public video-sharing sites supported by yt-dlp, including supported adult platforms.\n"
     "• Picks the best MP4 format within the size limit and merges with FFmpeg when needed.\n\n"
     "Limitations:\n"
-    f"• Max file size: {MAX_FILE_MB} MB (admin-configurable; Telegram's own Bot API limits still apply).\n"
+    f"• Max deliverable size: {EFFECTIVE_MAX_MB} MB (cloud API caps bot uploads at ~50 MB; a local Bot API server unlocks the full {MAX_FILE_MB} MB).\n"
     "• No DRM, paywall, login or private-content bypass.\n"
     "• Website support depends on yt-dlp extractors; not every URL will work."
 )
@@ -807,8 +816,8 @@ def main() -> None:
         print("Set BOT_TOKEN in Railway Variables, or copy .env.example to .env locally.")
         raise SystemExit(1)
     logger.info(
-        "Starting bot | max_file=%d MB | download_dir=%s | max_concurrent=%d",
-        MAX_FILE_MB, DOWNLOAD_DIR, MAX_CONCURRENT_DOWNLOADS,
+        "Starting bot | max_file=%d MB | effective_max=%d MB | download_dir=%s | max_concurrent=%d",
+        MAX_FILE_MB, EFFECTIVE_MAX_MB, DOWNLOAD_DIR, MAX_CONCURRENT_DOWNLOADS,
     )
     try:
         logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
