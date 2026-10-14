@@ -35,6 +35,19 @@ Supports publicly accessible videos from sites supported by `yt-dlp`, which incl
 | `MAX_CONCURRENT_DOWNLOADS` | no | `3` | Global concurrent download cap |
 | `REQUEST_TIMEOUT` | no | `120` | Network/extractor timeout (seconds). Uploads always allow at least 600 s. |
 | `TELEGRAM_API_URL` | no | — | Base URL of a self-hosted/local Bot API server, e.g. `http://localhost:8081`. Required for uploads above ~50 MB. |
+| `LOG_LEVEL` | no | `INFO` | Log verbosity: `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
+
+Copy-paste block for Railway → Service → Variables (only `BOT_TOKEN` is required):
+
+```env
+BOT_TOKEN=
+MAX_FILE_MB=700
+DOWNLOAD_DIR=/tmp/video_downloads
+MAX_CONCURRENT_DOWNLOADS=3
+REQUEST_TIMEOUT=120
+TELEGRAM_API_URL=
+LOG_LEVEL=INFO
+```
 
 ## Run locally
 

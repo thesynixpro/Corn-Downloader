@@ -22,7 +22,20 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — all settings come from environment variables.
+# Fill them in Railway: Service → Variables tab (or local .env file).
+#
+#   BOT_TOKEN              (required) Bot token from @BotFather.
+#   MAX_FILE_MB            (optional, default 700) Max video size in MB (1-2000).
+#                            >50 MB uploads need TELEGRAM_API_URL below.
+#   DOWNLOAD_DIR           (optional, default /tmp/video_downloads)
+#   MAX_CONCURRENT_DOWNLOADS (optional, default 3) Global download cap.
+#   REQUEST_TIMEOUT        (optional, default 120) Extractor/network timeout, seconds.
+#                            Uploads always get at least 600 s.
+#   TELEGRAM_API_URL       (optional) Self-hosted Bot API base URL, e.g.
+#                            http://localhost:8081 — required for >~50 MB uploads.
+#                            Leave empty to use Telegram's default cloud API.
+#   LOG_LEVEL              (optional, default INFO) DEBUG/INFO/WARNING/ERROR.
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -53,6 +66,9 @@ REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 120)
 TELEGRAM_API_URL = os.environ.get("TELEGRAM_API_URL", "").strip()
 # Large uploads need generous timeouts regardless of REQUEST_TIMEOUT.
 UPLOAD_TIMEOUT = max(REQUEST_TIMEOUT, 600)
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
+if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+    LOG_LEVEL = "INFO"
 
 MAX_BYTES = MAX_FILE_MB * 1024 * 1024
 URL_RE = re.compile(r"^https?://\S+\.\S+", re.IGNORECASE)
@@ -60,7 +76,7 @@ MAX_URL_LENGTH = 2048
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
 logger = logging.getLogger("uvd_bot")
 
