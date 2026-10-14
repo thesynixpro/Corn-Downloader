@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -277,8 +278,22 @@ def extract_metadata(url: str) -> dict:
         "extractor_retries": 1,
         **IMPERSONATE_OPT,
     }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as exc:  # noqa: BLE001
+            # One retry for 403s: datacenter blocks are sometimes transient.
+            low = str(exc).lower()
+            if attempt == 1 and ("403" in low or "forbidden" in low):
+                last_exc = exc
+                time.sleep(5)
+                continue
+            raise
+    else:  # pragma: no cover - loop always breaks or raises
+        raise last_exc or DownloadError("No metadata returned.")
     if info is None:
         raise DownloadError("No metadata returned.")
     # If a playlist slipped through, take first entry.
@@ -366,14 +381,19 @@ def map_download_error(exc: BaseException) -> str:
         return "Unable to download this video. The website extractor failed. Please check the URL and try again."
     text = str(exc)
     low = text.lower()
-    if "403" in low or "forbidden" in low:
+
+    def _has(*words: str) -> bool:
+        # Word-boundary match: avoids false hits like "age" inside "webpage".
+        return any(re.search(rf"\b{re.escape(w)}\b", low) for w in words)
+
+    if "403" in low or _has("forbidden"):
         return ("The website refused this download (HTTP 403). The site may be blocking "
                 "automated/server traffic. Please try again later or try another link.")
-    if any(k in low for k in ("private", "login", "log in", "sign in", "cookies", "age", "paywall", "drm", "geo", "region", "blocked", "unavailable")):
+    if _has("private", "login", "log in", "sign in", "cookies", "cookie", "age", "paywall", "drm", "geo", "region", "blocked", "unavailable"):
         return "This video is unavailable or requires access that this bot cannot provide."
-    if any(k in low for k in ("removed", "deleted", "not found", "404", "no video", "unable to extract")):
+    if _has("removed", "deleted", "not found", "404", "no video", "unable to extract"):
         return "Unable to download this video. Please check the URL and try again."
-    if "timeout" in low or "timed out" in low:
+    if "timeout" in low or _has("timed out"):
         return "The download timed out. Please try again later."
     if "ffmpeg" in low:
         return "Video processing failed (FFmpeg error). Please try another video."
@@ -750,6 +770,10 @@ def main() -> None:
         "Starting bot | max_file=%d MB | download_dir=%s | max_concurrent=%d",
         MAX_FILE_MB, DOWNLOAD_DIR, MAX_CONCURRENT_DOWNLOADS,
     )
+    try:
+        logger.info("yt-dlp version: %s", yt_dlp.version.__version__)
+    except Exception:  # noqa: BLE001
+        pass
     logger.info(
         "Note: changing MAX_FILE_MB does not override Telegram Bot API upload limits."
     )
