@@ -26,10 +26,33 @@ from telegram.ext import (
 # ---------------------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-MAX_FILE_MB = int(os.environ.get("MAX_FILE_MB", "50"))
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+# Max file size is admin-configurable. Default raised to 700 MB per request.
+# NOTE: Telegram's default Bot API only accepts ~50 MB uploads from bots.
+# Files >50 MB require a self-hosted/local Bot API server (see TELEGRAM_API_URL).
+MAX_FILE_MB = _int_env("MAX_FILE_MB", 700)
+if MAX_FILE_MB < 1:
+    MAX_FILE_MB = 1
+if MAX_FILE_MB > 2000:
+    MAX_FILE_MB = 2000
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/video_downloads")
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "3"))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "120"))
+MAX_CONCURRENT_DOWNLOADS = _int_env("MAX_CONCURRENT_DOWNLOADS", 3)
+if MAX_CONCURRENT_DOWNLOADS < 1:
+    MAX_CONCURRENT_DOWNLOADS = 1
+REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 120)
+# Optional custom Bot API server (required for uploads > ~50 MB).
+# Example: TELEGRAM_API_URL=http://localhost:8081
+TELEGRAM_API_URL = os.environ.get("TELEGRAM_API_URL", "").strip()
+# Large uploads need generous timeouts regardless of REQUEST_TIMEOUT.
+UPLOAD_TIMEOUT = max(REQUEST_TIMEOUT, 600)
 
 MAX_BYTES = MAX_FILE_MB * 1024 * 1024
 URL_RE = re.compile(r"^https?://\S+\.\S+", re.IGNORECASE)
@@ -434,8 +457,8 @@ async def run_download_job(
                     video=fh,
                     caption=caption,
                     supports_streaming=True,
-                    read_timeout=REQUEST_TIMEOUT,
-                    write_timeout=REQUEST_TIMEOUT,
+                    read_timeout=UPLOAD_TIMEOUT,
+                    write_timeout=UPLOAD_TIMEOUT,
                     connect_timeout=30,
                 )
         except asyncio.CancelledError:
@@ -614,7 +637,11 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
 def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable is not set.")
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if TELEGRAM_API_URL:
+        base = TELEGRAM_API_URL.rstrip("/")
+        builder = builder.base_url(f"{base}/bot").base_file_url(f"{base}/file/bot")
+    app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("about", cmd_about))
@@ -637,6 +664,15 @@ def main() -> None:
     logger.info(
         "Note: changing MAX_FILE_MB does not override Telegram Bot API upload limits."
     )
+    if MAX_FILE_MB > 50 and not TELEGRAM_API_URL:
+        logger.warning(
+            "MAX_FILE_MB=%d MB exceeds the default Bot API ~50 MB upload limit. "
+            "Uploads above ~50 MB will fail unless TELEGRAM_API_URL points to a "
+            "self-hosted local Bot API server.",
+            MAX_FILE_MB,
+        )
+    if TELEGRAM_API_URL:
+        logger.info("Using custom Telegram Bot API server (value hidden).")
     app = build_app()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

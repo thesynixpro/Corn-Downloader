@@ -30,10 +30,11 @@ Supports publicly accessible videos from sites supported by `yt-dlp`, which incl
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `BOT_TOKEN` | yes | — | Telegram bot token from [@BotFather](https://t.me/BotFather) |
-| `MAX_FILE_MB` | no | `50` | Max video size accepted. Changing it does **not** override Telegram Bot API upload limits (default Bot API ≈ 50 MB for bots). |
+| `MAX_FILE_MB` | no | `700` | Max video size accepted (1–2000). Changing it does **not** override Telegram Bot API upload limits (default Bot API ≈ 50 MB for bots; larger files need a self-hosted Bot API server via `TELEGRAM_API_URL`). |
 | `DOWNLOAD_DIR` | no | `/tmp/video_downloads` | Base temp directory |
 | `MAX_CONCURRENT_DOWNLOADS` | no | `3` | Global concurrent download cap |
-| `REQUEST_TIMEOUT` | no | `120` | Network/extractor timeout (seconds) |
+| `REQUEST_TIMEOUT` | no | `120` | Network/extractor timeout (seconds). Uploads always allow at least 600 s. |
+| `TELEGRAM_API_URL` | no | — | Base URL of a self-hosted/local Bot API server, e.g. `http://localhost:8081`. Required for uploads above ~50 MB. |
 
 ## Run locally
 
@@ -42,7 +43,7 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # FFmpeg must be installed: sudo apt install ffmpeg  (or brew install ffmpeg)
 export BOT_TOKEN="your-token-here"
-export MAX_FILE_MB=50
+export MAX_FILE_MB=700
 python bot.py
 ```
 
@@ -59,8 +60,9 @@ python -m py_compile bot.py
 3. **Create a Railway project:** [railway.app](https://railway.app) → New Project → Deploy from GitHub repo → select your repo.
 4. **Set variables:** open the service → **Variables** tab → add:
    - `BOT_TOKEN` = your token
-   - `MAX_FILE_MB` = `50` (optional)
+   - `MAX_FILE_MB` = `700` (optional)
    - `DOWNLOAD_DIR` = `/tmp/video_downloads` (optional)
+   - `TELEGRAM_API_URL` = your local Bot API base URL (optional, required for uploads above ~50 MB)
 5. **Confirm the builder:** Railway auto-detects the `Dockerfile`. No start-command override needed — the image runs `python bot.py`.
 6. **Deploy & check logs:** Deploy → **Logs** should show `Starting bot | max_file=...`. Send `/start` to your bot in Telegram.
 7. **No domains/ports needed.** This is a polling worker; do not add a web server or health-check endpoint.
@@ -85,6 +87,7 @@ python -m py_compile bot.py
 
 ## Notes / limits
 
-- Telegram Bot API bots can typically upload ~50 MB (up to ~2 GB only with a self-hosted Bot API server). Keep `MAX_FILE_MB` within what your Bot API setup supports.
+- Telegram Bot API bots can typically upload ~50 MB via the default cloud API (up to ~2 GB only with a self-hosted Bot API server + `TELEGRAM_API_URL`). `MAX_FILE_MB=700` therefore needs a local Bot API server for the >50 MB uploads to succeed; otherwise Telegram will reject them even though the bot downloads them.
+- Railway disks are ephemeral and small-service RAM is limited; 700 MB downloads raise disk/timeout pressure. Keep `MAX_CONCURRENT_DOWNLOADS` low (default `3`) and expect slower uploads for very large files.
 - yt-dlp extractor breakage happens when sites change; updating `yt-dlp` (redeploy) usually fixes it.
 - Never send cookies, credentials, or `.env` contents to the bot or logs.
