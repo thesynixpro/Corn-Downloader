@@ -125,6 +125,24 @@ if not FFMPEG_AVAILABLE:
 else:
     logger.info("FFmpeg found.")
 
+# Browser TLS impersonation (via curl_cffi) helps against sites that block
+# plain datacenter HTTP fingerprints with 403 errors. Legitimate technique:
+# it only makes requests look like a regular Chrome browser. No DRM,
+# paywall or login bypass involved.
+try:
+    import curl_cffi  # noqa: F401
+    HAS_IMPERSONATE = True
+except ImportError:
+    HAS_IMPERSONATE = False
+    logger.warning("curl_cffi not installed; browser impersonation disabled.")
+
+
+def _client_opts() -> dict:
+    """Extra yt-dlp opts so requests look like a regular browser."""
+    if HAS_IMPERSONATE:
+        return {"impersonate": "chrome"}
+    return {}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -218,6 +236,7 @@ def base_ydl_opts(tempdir: str, progress: dict) -> dict:
         "progress_hooks": [_hook],
         # Do NOT bypass DRM / paywalls / private content.
         "allow_unplayable_formats": False,
+        **_client_opts(),
     }
 
 
@@ -231,6 +250,7 @@ def extract_metadata(url: str) -> dict:
         "skip_download": True,
         "retries": 2,
         "extractor_retries": 1,
+        **_client_opts(),
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -321,6 +341,9 @@ def map_download_error(exc: BaseException) -> str:
         return "Unable to download this video. The website extractor failed. Please check the URL and try again."
     text = str(exc)
     low = text.lower()
+    if "403" in low or "forbidden" in low:
+        return ("The website refused this download (HTTP 403). The site may be blocking "
+                "automated/server traffic. Please try again later or try another link.")
     if any(k in low for k in ("private", "login", "log in", "sign in", "cookies", "age", "paywall", "drm", "geo", "region", "blocked", "unavailable")):
         return "This video is unavailable or requires access that this bot cannot provide."
     if any(k in low for k in ("removed", "deleted", "not found", "404", "no video", "unable to extract")):
