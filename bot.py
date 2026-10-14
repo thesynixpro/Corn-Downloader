@@ -425,6 +425,15 @@ async def run_download_job(
 
         try:
             info = await asyncio.to_thread(extract_metadata, url)
+        except AssertionError as exc:  # noqa: BLE001 - usually a site/extractor layout change
+            logger.warning("Metadata assertion failed for user %d: %r", user_id, exc, exc_info=True)
+            await safe_edit(
+                status_msg,
+                "❌ This video's page layout isn't readable right now (site may have changed). "
+                "Please try again later or try another link.",
+            )
+            user_status[user_id] = "failed"
+            return
         except Exception as exc:  # noqa: BLE001
             logger.info("Metadata extraction failed for user %d: %s: %s", user_id, type(exc).__name__, str(exc)[:300])
             await safe_edit(status_msg, f"❌ {map_download_error(exc)}")
