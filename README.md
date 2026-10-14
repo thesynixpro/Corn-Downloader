@@ -36,6 +36,7 @@ Supports publicly accessible videos from sites supported by `yt-dlp`, which incl
 | `REQUEST_TIMEOUT` | no | `120` | Network/extractor timeout (seconds). Uploads always allow at least 600 s. |
 | `TELEGRAM_API_URL` | no | — | Base URL of a self-hosted/local Bot API server, e.g. `http://localhost:8081`. Required for uploads above ~50 MB. |
 | `LOG_LEVEL` | no | `INFO` | Log verbosity: `DEBUG` / `INFO` / `WARNING` / `ERROR`. |
+| `API_ID` / `API_HASH` | no | — | From [my.telegram.org](https://my.telegram.org). Enables MTProto direct upload: single video files up to ~2 GB via the bot itself (same `BOT_TOKEN`, no user session). Without these (and without `TELEGRAM_API_URL`), files above ~50 MB are split into parts. |
 
 Copy-paste block for Railway → Service → Variables (only `BOT_TOKEN` is required):
 
@@ -47,6 +48,8 @@ MAX_CONCURRENT_DOWNLOADS=3
 REQUEST_TIMEOUT=120
 TELEGRAM_API_URL=
 LOG_LEVEL=INFO
+API_ID=
+API_HASH=
 ```
 
 ## Run locally

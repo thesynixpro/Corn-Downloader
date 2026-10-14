@@ -90,6 +90,14 @@ SPLIT_PART_MB = _int_env("SPLIT_PART_MB", 45)
 SPLIT_PART_MB = min(max(SPLIT_PART_MB, 20), 49)
 SPLIT_MAX_PARTS = _int_env("SPLIT_MAX_PARTS", 15)
 SPLIT_MAX_PARTS = min(max(SPLIT_MAX_PARTS, 2), 25)
+# Optional: MTProto direct upload (single files up to ~2 GB) via Telethon,
+# logged in as the BOT itself (same BOT_TOKEN, no user session needed).
+# Needs API_ID + API_HASH from https://my.telegram.org.
+# When set, large files upload directly instead of being split into parts.
+API_ID_RAW = os.environ.get("API_ID", "").strip()
+API_ID = int(API_ID_RAW) if API_ID_RAW.isdigit() else 0
+API_HASH = os.environ.get("API_HASH", "").strip()
+MTPROTO_ENABLED = bool(API_ID and API_HASH)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
 if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
     LOG_LEVEL = "INFO"
@@ -98,11 +106,11 @@ MAX_BYTES = MAX_FILE_MB * 1024 * 1024
 # Telegram cloud Bot API accepts ~50 MB uploads from bots. Anything bigger
 # needs a self-hosted local Bot API server (TELEGRAM_API_URL).
 CLOUD_UPLOAD_LIMIT = 50 * 1024 * 1024
-# Effective deliverable limit: without a local Bot API server, picking a
-# format above ~50 MB is pointless — it downloads fine but can never upload.
-# So cap format selection AND enforcement at 50 MB on the cloud API.
-# (With TELEGRAM_API_URL set, the full MAX_FILE_MB applies.)
-if TELEGRAM_API_URL:
+# Effective deliverable limit: without a local Bot API server or MTProto
+# direct upload, picking a format above ~50 MB is pointless — it downloads
+# fine but can never upload as one file (only via splitting, up to MAX).
+# (With TELEGRAM_API_URL or API_ID/API_HASH set, the full MAX_FILE_MB applies.)
+if TELEGRAM_API_URL or MTPROTO_ENABLED:
     EFFECTIVE_MAX_MB = MAX_FILE_MB
 else:
     EFFECTIVE_MAX_MB = min(MAX_FILE_MB, 50)
@@ -129,6 +137,10 @@ else:
     logger.info("BOT_TOKEN is configured (value hidden).")
 if TELEGRAM_API_URL:
     logger.info("Custom Bot API server: %s", TELEGRAM_API_URL)
+if MTPROTO_ENABLED:
+    logger.info("MTProto direct upload enabled (single files up to ~2 GB).")
+else:
+    logger.info("MTProto not configured (set API_ID/API_HASH for >50 MB single-file upload).")
 
 BASE_DOWNLOAD_DIR = Path(DOWNLOAD_DIR)
 try:
@@ -137,6 +149,46 @@ except Exception as exc:  # noqa: BLE001 - startup check only
     logger.error("Could not create DOWNLOAD_DIR %s: %s", DOWNLOAD_DIR, exc)
 
 download_semaphore = asyncio.Semaphore(max(1, MAX_CONCURRENT_DOWNLOADS))
+
+# Lazy MTProto client (Telethon), logged in as the BOT itself.
+# Uploads via MTProto bypass the cloud Bot API ~50 MB cap (up to ~2 GB).
+_mtproto_client = None
+_mtproto_lock = asyncio.Lock()
+
+
+async def get_mtproto_client():
+    """Connect once and return the MTProto client, or None if unavailable."""
+    global _mtproto_client
+    if _mtproto_client is not None:
+        try:
+            if _mtproto_client.is_connected():
+                return _mtproto_client
+        except Exception:  # noqa: BLE001
+            pass
+    if not MTPROTO_ENABLED:
+        return None
+    async with _mtproto_lock:
+        if _mtproto_client is not None:
+            try:
+                if _mtproto_client.is_connected():
+                    return _mtproto_client
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from telethon import TelegramClient
+        except ImportError:
+            logger.warning("telethon not installed; MTProto direct upload disabled.")
+            return None
+        try:
+            session_path = str(BASE_DOWNLOAD_DIR / "mtproto_bot_session")
+            client = TelegramClient(session_path, API_ID, API_HASH)
+            await client.start(bot_token=BOT_TOKEN)
+            _mtproto_client = client
+            logger.info("MTProto connected (direct upload up to ~2 GB available).")
+            return client
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MTProto connect failed: %s: %s", type(exc).__name__, str(exc)[:200])
+            return None
 
 # user_id -> asyncio.Task
 active_tasks: dict[int, asyncio.Task] = {}
@@ -684,38 +736,18 @@ async def run_download_job(
             return
 
         split_parts: list[str] = []
-        if size > EFFECTIVE_MAX_BYTES:
-            # Cloud API: files within MAX_FILE_MB are split into parts.
-            if not TELEGRAM_API_URL and size <= MAX_BYTES:
-                dur_s = info2.get("duration") or info.get("duration")
-                user_status[user_id] = "splitting"
-                await safe_edit(
-                    status_msg,
-                    f"✂️ Video is {format_bytes(size)} — splitting into parts for Telegram…",
-                )
-                try:
-                    split_parts = await asyncio.to_thread(split_video, filepath, tempdir, dur_s)
-                except SplitError as exc:
-                    logger.info("Split failed for user %d: %s", user_id, exc)
-                    await safe_edit(status_msg, f"❌ {exc}")
-                    user_status[user_id] = "failed: split"
-                    cleanup_dir(tempdir)
-                    async with tasks_lock:
-                        user_tempdir.pop(user_id, None)
-                    return
-                logger.info("Split %s into %d parts for user %d", format_bytes(size), len(split_parts), user_id)
-            else:
-                logger.info("File too large for user %d: %d bytes > limit %d", user_id, size, EFFECTIVE_MAX_BYTES)
-                await safe_edit(
-                    status_msg,
-                    f"❌ The video exceeds the configured file-size limit "
-                    f"({format_bytes(size)} > {EFFECTIVE_MAX_MB} MB).",
-                )
-                user_status[user_id] = "failed: too large"
-                cleanup_dir(tempdir)
-                async with tasks_lock:
-                    user_tempdir.pop(user_id, None)
-                return
+        if size > EFFECTIVE_MAX_BYTES and (TELEGRAM_API_URL or size > MAX_BYTES):
+            logger.info("File too large for user %d: %d bytes > limit %d", user_id, size, EFFECTIVE_MAX_BYTES)
+            await safe_edit(
+                status_msg,
+                f"❌ The video exceeds the configured file-size limit "
+                f"({format_bytes(size)} > {EFFECTIVE_MAX_MB} MB).",
+            )
+            user_status[user_id] = "failed: too large"
+            cleanup_dir(tempdir)
+            async with tasks_lock:
+                user_tempdir.pop(user_id, None)
+            return
 
         if size == 0:
             await safe_edit(status_msg, "❌ Unable to download this video. Please check the URL and try again.")
@@ -724,6 +756,58 @@ async def run_download_job(
             async with tasks_lock:
                 user_tempdir.pop(user_id, None)
             return
+
+        # Direct single-file upload via MTProto (up to ~2 GB), preferred over
+        # splitting whenever the cloud Bot API cap would otherwise apply.
+        if (size > CLOUD_UPLOAD_LIMIT and not TELEGRAM_API_URL
+                and size <= MAX_BYTES and MTPROTO_ENABLED):
+            user_status[user_id] = "uploading"
+            await safe_edit(
+                status_msg,
+                f"📤 Uploading large file directly ({format_bytes(size)})…\n🎬 {title[:100]}",
+            )
+            try:
+                client = await get_mtproto_client()
+                if client is None:
+                    raise RuntimeError("MTProto unavailable")
+                caption = f"🎬 {title[:900]}\n⏱ {duration} | 📦 {format_bytes(size)}"
+                await client.send_file(
+                    update.effective_chat.id, filepath,
+                    caption=caption, supports_streaming=True, force_document=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "MTProto upload failed for user %d (%s: %s); falling back to split",
+                    user_id, type(exc).__name__, str(exc)[:200],
+                )
+            else:
+                user_status[user_id] = "completed"
+                await safe_edit(status_msg, "✅ Download completed.")
+                cleanup_dir(tempdir)
+                async with tasks_lock:
+                    user_tempdir.pop(user_id, None)
+                return
+
+        # Cloud API without MTProto: split files within MAX_FILE_MB into parts.
+        if (not split_parts and size > CLOUD_UPLOAD_LIMIT and not TELEGRAM_API_URL
+                and size <= MAX_BYTES):
+            dur_s = info2.get("duration") or info.get("duration")
+            user_status[user_id] = "splitting"
+            await safe_edit(
+                status_msg,
+                f"✂️ Video is {format_bytes(size)} — splitting into parts for Telegram…",
+            )
+            try:
+                split_parts = await asyncio.to_thread(split_video, filepath, tempdir, dur_s)
+            except SplitError as exc:
+                logger.info("Split failed for user %d: %s", user_id, exc)
+                await safe_edit(status_msg, f"❌ {exc}")
+                user_status[user_id] = "failed: split"
+                cleanup_dir(tempdir)
+                async with tasks_lock:
+                    user_tempdir.pop(user_id, None)
+                return
+            logger.info("Split %s into %d parts for user %d", format_bytes(size), len(split_parts), user_id)
 
         user_status[user_id] = "uploading"
         await safe_edit(status_msg, f"📤 Uploading to Telegram… ({format_bytes(size)})\n🎬 {title[:100]}")
