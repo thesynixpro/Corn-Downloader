@@ -86,6 +86,9 @@ if LOG_LEVEL not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
     LOG_LEVEL = "INFO"
 
 MAX_BYTES = MAX_FILE_MB * 1024 * 1024
+# Telegram cloud Bot API accepts ~50 MB uploads from bots. Anything bigger
+# needs a self-hosted local Bot API server (TELEGRAM_API_URL).
+CLOUD_UPLOAD_LIMIT = 50 * 1024 * 1024
 URL_RE = re.compile(r"^https?://\S+\.\S+", re.IGNORECASE)
 MAX_URL_LENGTH = 2048
 
@@ -200,6 +203,25 @@ def is_valid_public_url(url: str) -> tuple[bool, str]:
     if host in ("localhost",) or host.startswith("127.") or host in ("::1",):
         return False, "unsafe_scheme"
     return True, ""
+
+
+def canonicalize_url(url: str) -> str:
+    """Rewrite known mirror domains to the canonical host of the same public site.
+
+    Example: xhamster46.desi/videos/... -> xhamster.com/videos/...
+    Same site, same paths — only the host differs, which yt-dlp may not recognize.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return url
+    host = (parsed.hostname or "").lower()
+    if re.match(r"^(www\.)?xhamster\d*\.", host):
+        try:
+            return parsed._replace(netloc="xhamster.com").geturl()
+        except Exception:  # noqa: BLE001
+            return url
+    return url
 
 
 def format_bytes(n: int | float | None) -> str:
@@ -579,10 +601,18 @@ async def run_download_job(
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Telegram upload failed for user %d: %s: %s", user_id, type(exc).__name__, str(exc)[:300])
-            await safe_edit(
-                status_msg,
-                "❌ The download completed, but Telegram could not upload the file.",
-            )
+            if size > CLOUD_UPLOAD_LIMIT and not TELEGRAM_API_URL:
+                await safe_edit(
+                    status_msg,
+                    f"❌ Downloaded ({format_bytes(size)}), but Telegram's cloud API rejects "
+                    f"bot uploads over ~50 MB. The admin needs a local Bot API server "
+                    f"(TELEGRAM_API_URL) for larger files.",
+                )
+            else:
+                await safe_edit(
+                    status_msg,
+                    "❌ The download completed, but Telegram could not upload the file.",
+                )
             user_status[user_id] = "failed: upload"
             cleanup_dir(tempdir)
             async with tasks_lock:
@@ -715,6 +745,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             await update.message.reply_text("Please send a valid public video URL.")
         return
+
+    canonical = canonicalize_url(url)
+    if canonical != url:
+        logger.info("Rewrote mirror URL host for user %d", user_id)
+        url = canonical
 
     status_msg = await update.message.reply_text("🔗 URL received. Checking URL…")
 
