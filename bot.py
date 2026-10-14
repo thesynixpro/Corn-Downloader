@@ -62,8 +62,22 @@ if MAX_CONCURRENT_DOWNLOADS < 1:
     MAX_CONCURRENT_DOWNLOADS = 1
 REQUEST_TIMEOUT = _int_env("REQUEST_TIMEOUT", 120)
 # Optional custom Bot API server (required for uploads > ~50 MB).
-# Example: TELEGRAM_API_URL=http://localhost:8081
-TELEGRAM_API_URL = os.environ.get("TELEGRAM_API_URL", "").strip()
+# Must include protocol, e.g. TELEGRAM_API_URL=https://api-example.up.railway.app
+# (Bare hostnames without http(s):// are auto-fixed to https://.)
+# Leave empty to use Telegram's default cloud API.
+def _normalize_api_url(raw: str) -> str:
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if "://" not in url:
+        url = "https://" + url
+    scheme = url.split("://", 1)[0].lower()
+    if scheme not in ("http", "https"):
+        return ""
+    return url
+
+
+TELEGRAM_API_URL = _normalize_api_url(os.environ.get("TELEGRAM_API_URL", ""))
 # Large uploads need generous timeouts regardless of REQUEST_TIMEOUT.
 UPLOAD_TIMEOUT = max(REQUEST_TIMEOUT, 600)
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").strip().upper()
@@ -86,6 +100,8 @@ if not BOT_TOKEN:
     logger.error("BOT_TOKEN is missing. Set it as an environment variable.")
 else:
     logger.info("BOT_TOKEN is configured (value hidden).")
+if TELEGRAM_API_URL:
+    logger.info("Custom Bot API server: %s", TELEGRAM_API_URL)
 
 BASE_DOWNLOAD_DIR = Path(DOWNLOAD_DIR)
 try:
