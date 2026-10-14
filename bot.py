@@ -371,9 +371,41 @@ def has_format_within_limit(info: dict) -> tuple[bool, int | None]:
     return False, smallest
 
 
-def download_video(url: str, tempdir: str, progress: dict) -> tuple[str, dict]:
+def pick_format_string(info: dict, cap: int) -> str | None:
+    """Choose an explicit yt-dlp format string fitting inside cap.
+
+    Picks the largest fitting rendition, preferring combined audio+video MP4.
+    Returns None when no usable size info exists (caller falls back to the
+    generic selector) or when nothing fits (caller rejects).
+    """
+    formats = [f for f in (info.get("formats") or []) if f.get("url") and f.get("format_id")]
+
+    def _size(f: dict) -> int | None:
+        s = f.get("filesize") or f.get("filesize_approx")
+        return int(s) if isinstance(s, (int, float)) and s > 0 else None
+
+    def _has_av(f: dict) -> bool:
+        return f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
+
+    sized = [(f, _size(f)) for f in formats]
+    sized = [(f, s) for f, s in sized if s is not None]
+    if not sized:
+        return None
+    fitting = [(f, s) for f, s in sized if s <= cap]
+    if not fitting:
+        return None
+    # Prefer combined A+V, then MP4, then largest size.
+    combined = [(f, s) for f, s in fitting if _has_av(f)]
+    pool = combined or fitting
+    pool.sort(key=lambda fs: (fs[1], 1 if fs[0].get("ext") == "mp4" else 0))
+    return str(pool[-1][0]["format_id"])
+
+
+def download_video(url: str, tempdir: str, progress: dict, format_override: str | None = None) -> tuple[str, dict]:
     """Blocking: download with yt-dlp. Returns (filepath, info). Runs in thread."""
     opts = base_ydl_opts(tempdir, progress)
+    if format_override:
+        opts["format"] = f"{format_override}/{build_format_selector()}"
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if info is None:
@@ -535,6 +567,13 @@ async def run_download_job(
             user_status[user_id] = "failed: too large"
             return
 
+        # Pin an explicit fitting rendition when possible. Without this,
+        # yt-dlp's fallback chain can grab an over-limit format when sizes
+        # are unknown, wasting a full download that the post-check rejects.
+        picked = pick_format_string(info, EFFECTIVE_MAX_BYTES)
+        if picked:
+            logger.info("Pinned format %s for user %d (cap %d MB)", picked, user_id, EFFECTIVE_MAX_MB)
+
         if not FFMPEG_AVAILABLE:
             logger.warning("FFmpeg missing; attempting download anyway (merge may fail).")
 
@@ -544,7 +583,7 @@ async def run_download_job(
 
         try:
             async with download_semaphore:
-                filepath, info2 = await asyncio.to_thread(download_video, url, tempdir, progress)
+                filepath, info2 = await asyncio.to_thread(download_video, url, tempdir, progress, picked)
                 if info2.get("title"):
                     title = info2["title"]
         except asyncio.CancelledError:
