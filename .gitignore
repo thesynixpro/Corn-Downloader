@@ -6,4 +6,5 @@ venv/
 *.mp4
 *.mkv
 *.webm
+*.zip
 /tmp/video_downloads/
