@@ -7,6 +7,20 @@ tested without importing yt-dlp.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+QUALITY_TARGETS = (2160, 1440, 1080, 720, 480, 360)
+
+
+@dataclass(frozen=True)
+class QualityOption:
+    target_height: int
+    format_id: str
+    width: int | None
+    height: int
+    ext: str
+    estimated_bytes: int | None
+
 
 def build_format_selector(max_bytes: int) -> str:
     """Fallback selector: prefer combined MP4 streams inside the size cap."""
@@ -99,6 +113,71 @@ def pick_format_string(info: dict, cap: int, max_height: int = 0) -> str | None:
 
     pool.sort(key=sort_key)
     return str(pool[-1][0]["format_id"])
+
+
+def _combined_sized_entries(info: dict) -> list[tuple[dict, int, int]]:
+    """Return combined audio/video formats with known sizes and heights."""
+    usable: list[tuple[dict, int, int]] = []
+    for entry in info.get("formats") or []:
+        if not entry.get("url") or not entry.get("format_id"):
+            continue
+        size = _size_of(entry)
+        height = _height_of(entry)
+        if size is None or height <= 0 or not _has_av(entry):
+            continue
+        usable.append((entry, size, height))
+    return usable
+
+
+def build_quality_options(
+    info: dict, cap_bytes: int, max_height: int = 0, limit: int = 5
+) -> list[QualityOption]:
+    """Build honest quality options backed by known-size combined formats."""
+    usable = [
+        (entry, size, height)
+        for entry, size, height in _combined_sized_entries(info)
+        if size <= cap_bytes and (max_height <= 0 or height <= max_height)
+    ]
+    usable.sort(
+        key=lambda item: (item[2], item[1], 1 if item[0].get("ext") == "mp4" else 0),
+        reverse=True,
+    )
+    options: list[QualityOption] = []
+    seen_heights: set[int] = set()
+    for entry, size, height in usable:
+        if height in seen_heights or len(options) >= max(1, limit):
+            continue
+        seen_heights.add(height)
+        width = entry.get("width")
+        options.append(
+            QualityOption(
+                target_height=height,
+                format_id=str(entry.get("format_id")),
+                width=int(width) if isinstance(width, (int, float)) and width > 0 else None,
+                height=height,
+                ext=str(entry.get("ext") or ""),
+                estimated_bytes=size,
+            )
+        )
+    return options
+
+
+def selector_for_height(info: dict, cap_bytes: int, target_height: int) -> str | None:
+    """Select a concrete combined format at or below an explicit height."""
+    if target_height <= 0:
+        return None
+    usable = [
+        (entry, size, height)
+        for entry, size, height in _combined_sized_entries(info)
+        if size <= cap_bytes and height <= target_height
+    ]
+    if not usable:
+        return None
+    usable.sort(
+        key=lambda item: (item[2], item[1], 1 if item[0].get("ext") == "mp4" else 0),
+        reverse=True,
+    )
+    return str(usable[0][0].get("format_id"))
 
 
 def best_display_format(info: dict) -> dict:

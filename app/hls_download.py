@@ -24,8 +24,9 @@ import httpx
 
 from . import hls, media, net
 from .config import Settings
-from .hls import DRMProtectedError, MediaPlaylist, PlaylistError, Variant
+from .hls import DRMProtectedError, MasterPlaylist, MediaPlaylist, PlaylistError, Variant
 from .progress import Progress, RateMeter
+from .selections import QualityUnavailableError
 from .urlguard import ensure_public_url
 
 logger = logging.getLogger("uvd_bot.hls")
@@ -53,10 +54,146 @@ class HlsOutcome:
     is_live: bool
 
 
+@dataclass(frozen=True)
+class HlsVariantChoice:
+    index: int
+    width: int | None
+    height: int | None
+    resolution: str
+    bitrate_kbps: int
+    has_audio: bool
+
+
+async def fetch_master_playlist(
+    url: str,
+    settings: Settings,
+    headers: dict[str, str] | None = None,
+) -> MasterPlaylist:
+    async with net.make_client(settings, headers) as client:
+        text, _final_url = await net.fetch_text(
+            client, url, settings, headers, max_bytes=MAX_PLAYLIST_BYTES
+        )
+    if hls.detect_playlist_kind(text) != hls.PlaylistKind.MASTER:
+        raise PlaylistError("The URL did not return an HLS master playlist.")
+    master = hls.parse_master(text, url)
+    if master.has_drm:
+        raise DRMProtectedError("The playlist declares DRM-protected session keys.")
+    return master
+
+
+def describe_variant_choices(master: MasterPlaylist) -> list[HlsVariantChoice]:
+    choices: list[HlsVariantChoice] = []
+    for index, variant in enumerate(master.variants):
+        has_audio = bool(
+            variant.audio_group
+            and any(
+                rendition.type == "AUDIO"
+                and rendition.group_id == variant.audio_group
+                and rendition.uri
+                for rendition in master.renditions
+            )
+        )
+        choices.append(
+            HlsVariantChoice(
+                index=index,
+                width=variant.width,
+                height=variant.height,
+                resolution=variant.resolution,
+                bitrate_kbps=variant.bitrate_kbps,
+                has_audio=has_audio,
+            )
+        )
+    return choices
+
+
+def _hls_cap(settings: Settings, max_height: int | None) -> int:
+    if max_height is not None:
+        return max(0, max_height)
+    return max(0, settings.max_height)
+
+
+def _choose_variant(
+    master: MasterPlaylist,
+    settings: Settings,
+    *,
+    variant_index: int | None = None,
+    target_height: int | None = None,
+    max_height: int | None = None,
+) -> Variant:
+    cap = _hls_cap(settings, max_height)
+    if variant_index is not None:
+        if variant_index < 0 or variant_index >= len(master.variants):
+            raise QualityUnavailableError("The selected HLS quality is no longer available.")
+        variant = master.variants[variant_index]
+        if cap > 0 and variant.height and variant.height > cap:
+            raise QualityUnavailableError("The selected HLS quality exceeds the quality limit.")
+        return variant
+    if target_height is not None:
+        candidates = [
+            variant
+            for variant in master.variants
+            if variant.height == target_height and (cap <= 0 or (variant.height or 0) <= cap)
+        ]
+        if not candidates:
+            raise QualityUnavailableError(f"{target_height}p is not available for this HLS stream.")
+        return hls.select_variant(candidates, 0)
+    return hls.select_variant(master.variants, cap)
+
+
+async def _inspect_variant(
+    master_url: str,
+    master: MasterPlaylist,
+    variant: Variant,
+    settings: Settings,
+    headers: dict[str, str] | None = None,
+) -> HlsInspection:
+    async with net.make_client(settings, headers) as client:
+        variant_text, _ = await net.fetch_text(
+            client, variant.uri, settings, headers, max_bytes=MAX_PLAYLIST_BYTES
+        )
+        if hls.detect_playlist_kind(variant_text) == hls.PlaylistKind.MASTER:
+            raise PlaylistError("Nested master playlists are not supported.")
+        playlist = hls.parse_media(variant_text, variant.uri)
+        audio_rendition = hls.select_audio_rendition(master.renditions, variant)
+        audio_playlist = None
+        audio_label = ""
+        if audio_rendition is not None and audio_rendition.uri:
+            audio_text, _ = await net.fetch_text(
+                client, audio_rendition.uri, settings, headers, max_bytes=MAX_PLAYLIST_BYTES
+            )
+            audio_playlist = hls.parse_media(audio_text, audio_rendition.uri)
+            audio_label = audio_rendition.language or audio_rendition.name or "audio"
+        if playlist.has_drm:
+            raise DRMProtectedError("The media playlist is DRM-protected (SAMPLE-AES).")
+        if audio_playlist is not None and audio_playlist.has_drm:
+            raise DRMProtectedError("The audio playlist is DRM-protected (SAMPLE-AES).")
+        estimate = playlist.estimate_bytes(variant.bandwidth)
+        if estimate and audio_playlist is not None:
+            estimate += audio_playlist.estimate_bytes(128_000) or 0
+        label = f"HLS {variant.resolution}"
+        if variant.bitrate_kbps:
+            label += f" @ {variant.bitrate_kbps} kbps"
+        if audio_playlist is not None:
+            label += f" + audio ({audio_label})"
+        return HlsInspection(
+            playlist=playlist,
+            variant=variant,
+            audio_playlist=audio_playlist,
+            audio_label=audio_label,
+            label=label,
+            is_live=playlist.is_live,
+            estimated_bytes=estimate,
+        )
+
+
 async def inspect_hls(
     url: str,
     settings: Settings,
     headers: dict[str, str] | None = None,
+    *,
+    variant_index: int | None = None,
+    target_height: int | None = None,
+    max_height: int | None = None,
 ) -> HlsInspection:
     """Fetch and parse the playlist hierarchy, choosing a variant."""
     async with net.make_client(settings, headers) as client:
@@ -66,42 +203,19 @@ async def inspect_hls(
             master = hls.parse_master(text, url)
             if master.has_drm:
                 raise DRMProtectedError("The playlist declares DRM-protected session keys.")
-            variant = hls.select_variant(master.variants, settings.max_height)
-            variant_text, _ = await net.fetch_text(client, variant.uri, settings, headers, max_bytes=MAX_PLAYLIST_BYTES)
-            if hls.detect_playlist_kind(variant_text) == hls.PlaylistKind.MASTER:
-                raise PlaylistError("Nested master playlists are not supported.")
-            playlist = hls.parse_media(variant_text, variant.uri)
-            audio_rendition = hls.select_audio_rendition(master.renditions, variant)
-            audio_playlist = None
-            audio_label = ""
-            if audio_rendition is not None and audio_rendition.uri:
-                audio_text, _ = await net.fetch_text(
-                    client, audio_rendition.uri, settings, headers, max_bytes=MAX_PLAYLIST_BYTES
-                )
-                audio_playlist = hls.parse_media(audio_text, audio_rendition.uri)
-                audio_label = audio_rendition.language or audio_rendition.name or "audio"
-            if playlist.has_drm:
-                raise DRMProtectedError("The media playlist is DRM-protected (SAMPLE-AES).")
-            if audio_playlist is not None and audio_playlist.has_drm:
-                raise DRMProtectedError("The audio playlist is DRM-protected (SAMPLE-AES).")
-            estimate = playlist.estimate_bytes(variant.bandwidth)
-            if estimate and audio_playlist is not None:
-                estimate += audio_playlist.estimate_bytes(128_000) or 0
-            label = f"HLS {variant.resolution}"
-            if variant.bitrate_kbps:
-                label += f" @ {variant.bitrate_kbps} kbps"
-            if audio_playlist is not None:
-                label += f" + audio ({audio_label})"
-            return HlsInspection(
-                playlist=playlist,
-                variant=variant,
-                audio_playlist=audio_playlist,
-                audio_label=audio_label,
-                label=label,
-                is_live=playlist.is_live,
-                estimated_bytes=estimate,
+            variant = _choose_variant(
+                master,
+                settings,
+                variant_index=variant_index,
+                target_height=target_height,
+                max_height=max_height,
             )
+            return await _inspect_variant(url, master, variant, settings, headers)
         if kind == hls.PlaylistKind.MEDIA:
+            if variant_index is not None or target_height is not None:
+                raise QualityUnavailableError(
+                    "Quality selection is unavailable for this single-stream playlist."
+                )
             playlist = hls.parse_media(text, url)
             if playlist.has_drm:
                 raise DRMProtectedError("The media playlist is DRM-protected (SAMPLE-AES).")

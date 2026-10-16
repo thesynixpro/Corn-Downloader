@@ -92,6 +92,8 @@ class Settings:
     hls_segment_concurrency: int = 4
     hls_referer: str = ""
     hls_user_agent: str = DEFAULT_USER_AGENT
+    data_dir: Path = field(default_factory=lambda: Path("/tmp/video_downloads/bot_data"))
+    support_chat_id: int | None = None
 
     @property
     def max_bytes(self) -> int:
@@ -120,8 +122,24 @@ class Settings:
         return self.max_temp_disk_mb * 1024 * 1024
 
 
+def _env_chat_id(name: str) -> int | None:
+    raw = _env_str(name)
+    if not raw:
+        return None
+    normalized = raw[1:] if raw.startswith("-") else raw
+    if not normalized.isdigit():
+        return None
+    try:
+        return -int(normalized) if raw.startswith("-") else int(normalized)
+    except ValueError:
+        return None
+
+
 def load_settings() -> Settings:
     _load_dotenv()
+    download_dir = Path(_env_str("DOWNLOAD_DIR", "/tmp/video_downloads"))
+    data_dir_raw = _env_str("DATA_DIR")
+    data_dir = Path(data_dir_raw) if data_dir_raw else download_dir / "bot_data"
     log_level = _env_str("LOG_LEVEL", "INFO").upper()
     if log_level not in VALID_LOG_LEVELS:
         log_level = "INFO"
@@ -132,7 +150,9 @@ def load_settings() -> Settings:
     return Settings(
         bot_token=_env_str("BOT_TOKEN"),
         max_file_mb=_env_int("MAX_FILE_MB", 700, minimum=1, maximum=2000),
-        download_dir=Path(_env_str("DOWNLOAD_DIR", "/tmp/video_downloads")),
+        download_dir=download_dir,
+        data_dir=data_dir,
+        support_chat_id=_env_chat_id("SUPPORT_CHAT_ID"),
         max_concurrent_downloads=_env_int("MAX_CONCURRENT_DOWNLOADS", 3, minimum=1, maximum=16),
         request_timeout=_env_int("REQUEST_TIMEOUT", 120, minimum=5, maximum=3600),
         connect_timeout=_env_int("CONNECT_TIMEOUT", 30, minimum=3, maximum=120),

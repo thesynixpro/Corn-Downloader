@@ -28,6 +28,7 @@ from .config import Settings
 from .format_select import build_format_selector
 from .hls import DRMProtectedError, PlaylistError
 from .progress import Progress
+from .selections import QualitySelection, QualityUnavailableError
 
 logger = logging.getLogger("uvd_bot.downloader")
 
@@ -272,11 +273,20 @@ async def inspect_source(
     url: str,
     settings: Settings,
     headers: dict[str, str] | None = None,
+    *,
+    selection: QualitySelection | None = None,
+    max_height: int | None = None,
 ) -> SourceInspection:
     """Decide which engine to use and (for HLS) select a variant up front."""
     if platforms.is_probable_hls(url):
         try:
-            inspection = await hls_download.inspect_hls(url, settings, headers)
+            inspection = await hls_download.inspect_hls(
+                url,
+                settings,
+                headers,
+                target_height=selection.target_height if selection and selection.is_explicit else None,
+                max_height=max_height,
+            )
             return SourceInspection(
                 kind="hls",
                 label=inspection.label,
@@ -311,9 +321,10 @@ async def download_media(
     inspection: SourceInspection | None = None,
     format_override: str | None = None,
     headers: dict[str, str] | None = None,
+    selection: QualitySelection | None = None,
 ) -> DownloadResult:
     """Download ``url`` using the routed engine, with safe fallbacks."""
-    inspection = inspection or await inspect_source(url, settings, headers)
+    inspection = inspection or await inspect_source(url, settings, headers, selection=selection)
     if inspection.kind == "hls" and inspection.hls is not None:
         dest = os.path.join(tempdir, "video.mp4")
         try:
@@ -322,7 +333,13 @@ async def download_media(
             )
         except DRMProtectedError:
             raise
+        except QualityUnavailableError:
+            raise
         except (PlaylistError, net.NetworkError, media.MediaError) as exc:
+            if selection is not None and selection.is_explicit:
+                raise QualityUnavailableError(
+                    "The selected HLS quality became unavailable during download."
+                ) from exc
             logger.info("Native HLS download failed (%s); falling back to yt-dlp.", exc)
         else:
             return DownloadResult(

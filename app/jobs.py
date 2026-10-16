@@ -11,20 +11,30 @@ import asyncio
 import contextlib
 import logging
 import os
+import secrets
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from telegram.ext import ContextTypes
 
-from . import downloader, errors, media, platforms
+from . import downloader, errors, media, platforms, tgui, ui
 from .config import Settings
-from .format_select import best_display_format, has_format_within_limit, pick_format_string
-from .formatting import format_bytes, format_duration, render_progress
+from .format_select import (
+    best_display_format,
+    build_quality_options,
+    has_format_within_limit,
+    pick_format_string,
+    selector_for_height,
+)
+from .formatting import format_bytes, format_duration
 from .hls import DRMProtectedError
 from .net import DownloadTooLargeError, NetworkError
 from .progress import Progress
+from .selections import QualitySelection, QualityUnavailableError, effective_height_cap
+from .store import UserStore
 from .uploader import UploadError, Uploader
 from .urlguard import URLGuardError, redact_url
 
@@ -35,25 +45,170 @@ class TooLargeError(Exception):
     """Raised when a video exceeds configured size or storage limits."""
 
 
+@dataclass(frozen=True)
+class PendingOption:
+    key: str
+    label: str
+    target_height: int | None
+
+
+@dataclass
+class PendingSession:
+    id: str
+    user_id: int
+    url: str
+    kind: str
+    title: str
+    duration: float
+    label: str
+    platform: str
+    created_at: float
+    options: tuple[PendingOption, ...] = ()
+    live: bool = False
+
+
+@dataclass
+class LastRequest:
+    url: str
+    selection: QualitySelection
+    created_at: float
+
+
+PENDING_TTL_SECONDS = 600.0
+
+
 class JobManager:
-    """Tracks per-user tasks, queue positions, temp dirs and statuses."""
+    """Tracks per-user tasks, queue positions, temp dirs, UI sessions, and stats."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.uploader = Uploader(settings)
+        self.store = UserStore(settings.data_dir / "uvd_bot.sqlite3")
         self.semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
         self._lock = asyncio.Lock()
         self._tasks: dict[int, asyncio.Task] = {}
         self._tempdirs: dict[int, str] = {}
         self._statuses: dict[int, str] = {}
         self._waiting: dict[int, float] = {}
+        self._pending: dict[str, PendingSession] = {}
+        self._reserved: set[int] = set()
+        self._last_requests: dict[int, LastRequest] = {}
+        self._feedback_pending: set[int] = set()
 
     async def register(self, user_id: int, task: asyncio.Task, tempdir: str) -> None:
         async with self._lock:
             self._tasks[user_id] = task
             self._tempdirs[user_id] = tempdir
             self._statuses[user_id] = "queued"
+            self._reserved.discard(user_id)
         task.add_done_callback(lambda finished: asyncio.create_task(self._forget(user_id, finished)))
+
+    async def try_reserve(self, user_id: int) -> bool:
+        """Atomically reserve a user for an imminent job to prevent duplicates."""
+        async with self._lock:
+            task = self._tasks.get(user_id)
+            if (task is not None and not task.done()) or user_id in self._reserved:
+                return False
+            self._reserved.add(user_id)
+            return True
+
+    async def release_reservation(self, user_id: int) -> None:
+        async with self._lock:
+            self._reserved.discard(user_id)
+
+    async def get_prefs(self, user_id: int) -> dict[str, str]:
+        return await asyncio.to_thread(self.store.get_preferences, user_id)
+
+    async def set_pref(self, user_id: int, key: str, value: str) -> dict[str, str]:
+        return await asyncio.to_thread(self.store.set_preference, user_id, key, value)
+
+    async def record_completion(
+        self, user_id: int, platform: str, mode: str, parts: int, size_bytes: int
+    ) -> None:
+        await asyncio.to_thread(
+            self.store.record_download, user_id, platform, mode, parts, size_bytes
+        )
+
+    async def get_stats(self, user_id: int) -> dict[str, int | float | None]:
+        return await asyncio.to_thread(self.store.get_stats, user_id)
+
+    def _prune_pending(self) -> None:
+        now = time.monotonic()
+        expired = [
+            session_id
+            for session_id, session in self._pending.items()
+            if now - session.created_at > PENDING_TTL_SECONDS
+        ]
+        for session_id in expired:
+            self._pending.pop(session_id, None)
+
+    def create_pending_session(
+        self,
+        *,
+        user_id: int,
+        url: str,
+        kind: str,
+        title: str,
+        duration: float,
+        label: str,
+        platform: str,
+        options: tuple[PendingOption, ...],
+        live: bool = False,
+    ) -> PendingSession:
+        self._prune_pending()
+        session = PendingSession(
+            id=secrets.token_hex(6),
+            user_id=user_id,
+            url=url,
+            kind=kind,
+            title=title,
+            duration=duration,
+            label=label,
+            platform=platform,
+            created_at=time.monotonic(),
+            options=options,
+            live=live,
+        )
+        self._pending[session.id] = session
+        return session
+
+    def peek_pending_session(self, user_id: int, session_id: str) -> PendingSession | None:
+        self._prune_pending()
+        session = self._pending.get(session_id)
+        if session is None or session.user_id != user_id:
+            return None
+        return session
+
+    def pop_pending_session(self, user_id: int, session_id: str) -> PendingSession | None:
+        self._prune_pending()
+        session = self._pending.pop(session_id, None)
+        if session is None or session.user_id != user_id:
+            if session is not None:
+                self._pending[session.id] = session
+            return None
+        return session
+
+    def clear_pending_for_user(self, user_id: int) -> None:
+        self._prune_pending()
+        for session_id in [sid for sid, session in self._pending.items() if session.user_id == user_id]:
+            self._pending.pop(session_id, None)
+
+    def set_last_request(self, user_id: int, url: str, selection: QualitySelection) -> None:
+        self._last_requests[user_id] = LastRequest(
+            url=url, selection=selection, created_at=time.monotonic()
+        )
+
+    def get_last_request(self, user_id: int) -> LastRequest | None:
+        return self._last_requests.get(user_id)
+
+    def set_feedback_pending(self, user_id: int) -> None:
+        self._feedback_pending.add(user_id)
+
+    def clear_feedback_pending(self, user_id: int) -> None:
+        self._feedback_pending.discard(user_id)
+
+    def is_feedback_pending(self, user_id: int) -> bool:
+        return user_id in self._feedback_pending
 
     async def _forget(self, user_id: int, task: asyncio.Task) -> None:
         async with self._lock:
@@ -83,6 +238,7 @@ class JobManager:
         async with self._lock:
             task = self._tasks.get(user_id)
             tempdir = self._tempdirs.pop(user_id, None)
+            self._reserved.discard(user_id)
         if task is None or task.done():
             cleanup_dir(tempdir, self.settings)
             return False
@@ -149,6 +305,9 @@ class JobManager:
             self._tasks.clear()
             tempdirs = list(self._tempdirs.values())
             self._tempdirs.clear()
+            self._pending.clear()
+            self._reserved.clear()
+            self._feedback_pending.clear()
         for _uid, task in tasks:
             task.cancel()
         for _uid, task in tasks:
@@ -182,49 +341,129 @@ async def safe_edit(message, text: str) -> None:
         pass
 
 
-async def _status_loop(progress: Progress, status_msg, manager: JobManager, user_id: int) -> None:
+async def _status_loop(
+    progress: Progress,
+    status_msg,
+    manager: JobManager,
+    user_id: int,
+    interval: float = 3.0,
+) -> None:
     last_text = ""
     while True:
-        await asyncio.sleep(3)
-        text = render_progress(progress, manager.queue_position(user_id))
-        if text and text != last_text:
-            last_text = text
-            await safe_edit(status_msg, text)
+        await asyncio.sleep(max(1.0, interval))
+        card = ui.status_card(
+            title=progress.title or "Video",
+            label=progress.label or "Source",
+            phase=progress.stage,
+            downloaded=progress.downloaded,
+            total=progress.total,
+            speed=progress.speed,
+            eta=progress.eta,
+            detail=progress.detail,
+            queue_position=manager.queue_position(user_id),
+            show_cancel=True,
+        )
+        if card.text != last_text:
+            last_text = card.text
+            await tgui.edit_card(status_msg, card)
 
 
-def _failure_text(exc: BaseException, settings: Settings) -> str:
+def failure_card(
+    exc: BaseException,
+    settings: Settings,
+    *,
+    retry_available: bool,
+    support_enabled: bool,
+) -> ui.Card:
     if isinstance(exc, DRMProtectedError):
-        return f"❌ {exc}\n\nThe bot does not bypass DRM."
+        return ui.error_card(
+            kind="drm",
+            message=f"{exc} The bot does not bypass DRM.",
+            support_enabled=support_enabled,
+        )
     if isinstance(exc, TooLargeError):
-        return f"❌ {exc}"
+        return ui.error_card(kind="too_large", message=str(exc), support_enabled=support_enabled)
     if isinstance(exc, DownloadTooLargeError):
-        return f"❌ The video exceeds the configured size limit ({settings.max_file_mb} MB)."
+        return ui.error_card(
+            kind="too_large",
+            message=f"The video exceeds the configured size limit ({settings.max_file_mb} MB).",
+            support_enabled=support_enabled,
+        )
     if isinstance(exc, URLGuardError):
-        return "❌ This URL is not allowed: the host is blocked, private, or not on the allow-list."
+        return ui.error_card(
+            kind="blocked",
+            message="This URL is not allowed: the host is blocked, private, or not on the allow-list.",
+            support_enabled=support_enabled,
+        )
     if isinstance(exc, UploadError):
-        return (
-            "❌ The download completed, but Telegram could not upload the file."
-            f"\n\n🔧 Detail: {errors.short_detail(exc)}"
+        return ui.error_card(
+            kind="failed",
+            message="The download completed, but Telegram could not upload the file.",
+            detail=errors.short_detail(exc),
+            retry=retry_available,
+            support_enabled=support_enabled,
         )
     if isinstance(exc, AssertionError):
-        return (
-            "❌ This video's page layout isn't readable right now (the site may have changed). "
-            "Please try again later or use another link."
-            f"\n\n🔧 Detail: {errors.short_detail(exc)}"
+        return ui.error_card(
+            kind="failed",
+            message=(
+                "This video's page layout isn't readable right now (the site may have changed). "
+                "Please try again later or use another link."
+            ),
+            detail=errors.short_detail(exc),
+            retry=retry_available,
+            support_enabled=support_enabled,
         )
     if isinstance(exc, media.MediaError):
-        return f"❌ Video validation failed: {errors.short_detail(exc)}"
+        return ui.error_card(
+            kind="failed",
+            message="Video validation failed.",
+            detail=errors.short_detail(exc),
+            retry=retry_available,
+            support_enabled=support_enabled,
+        )
     if isinstance(exc, NetworkError):
-        return (
-            "❌ The download failed due to a network error. Please try again later."
-            f"\n\n🔧 Detail: {errors.short_detail(exc)}"
+        return ui.error_card(
+            kind="network",
+            message="The download failed due to a network error. Please try again later.",
+            detail=errors.short_detail(exc),
+            retry=retry_available,
+            support_enabled=support_enabled,
+        )
+    if isinstance(exc, QualityUnavailableError):
+        return ui.error_card(
+            kind="quality",
+            message=str(exc),
+            retry=retry_available,
+            support_enabled=support_enabled,
         )
     mapped = errors.map_download_error(exc)
     detail = errors.short_detail(exc)
-    text = f"❌ {mapped}"
-    if detail and detail.lower() not in mapped.lower():
-        text += f"\n\n🔧 Detail: {detail}"
-    return text
+    lowered = mapped.lower()
+    if "not currently supported" in lowered:
+        kind, include_platforms, show_detail = "unsupported", True, False
+    elif "login" in lowered or "cannot and will not bypass" in lowered:
+        kind, include_platforms, show_detail = "auth", False, False
+    elif "drm" in lowered:
+        kind, include_platforms, show_detail = "drm", False, False
+    elif "geo-restricted" in lowered:
+        kind, include_platforms, show_detail = "geo", False, False
+    elif "expired" in lowered:
+        kind, include_platforms, show_detail = "expired", False, True
+    elif "403" in lowered or "timed out" in lowered:
+        kind, include_platforms, show_detail = "network", False, True
+    else:
+        kind, include_platforms, show_detail = "failed", False, True
+    if show_detail and detail and detail.lower() in lowered:
+        detail = ""
+    return ui.error_card(
+        kind=kind,
+        message=mapped,
+        detail=detail if show_detail else "",
+        retry=retry_available and kind in ("failed", "network", "expired", "quality", "unexpected"),
+        support_enabled=support_enabled,
+        include_platforms=include_platforms,
+    )
 
 
 async def run_download_job(
@@ -235,15 +474,34 @@ async def run_download_job(
     user_id: int,
     tempdir: str,
     manager: JobManager,
+    *,
+    selection: QualitySelection | None = None,
+    default_quality: str = "auto",
+    upload_mode: str = "stream",
+    progress_interval: float = 3.0,
 ) -> None:
     settings = manager.settings
     progress = Progress(stage="inspecting")
-    poller = asyncio.create_task(_status_loop(progress, status_msg, manager, user_id))
+    poller = asyncio.create_task(
+        _status_loop(progress, status_msg, manager, user_id, interval=progress_interval)
+    )
     try:
-        await _pipeline(url, update, context, status_msg, user_id, tempdir, manager, progress)
+        await _pipeline(
+            url,
+            update,
+            context,
+            status_msg,
+            user_id,
+            tempdir,
+            manager,
+            progress,
+            selection=selection or QualitySelection(),
+            default_quality=default_quality,
+            upload_mode=upload_mode,
+        )
     except asyncio.CancelledError:
         await manager.set_status(user_id, "cancelled")
-        await safe_edit(status_msg, "🛑 Download cancelled and temporary files removed.")
+        await tgui.edit_card(status_msg, ui.cancelled_card())
         logger.info("Download cancelled for user %d", user_id)
         raise
     except Exception as exc:
@@ -254,7 +512,15 @@ async def run_download_job(
             str(exc)[:300],
         )
         await manager.set_status(user_id, "failed")
-        await safe_edit(status_msg, _failure_text(exc, settings))
+        await tgui.edit_card(
+            status_msg,
+            failure_card(
+                exc,
+                settings,
+                retry_available=manager.get_last_request(user_id) is not None,
+                support_enabled=manager.settings.support_chat_id is not None,
+            ),
+        )
     finally:
         poller.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -272,6 +538,10 @@ async def _pipeline(
     tempdir: str,
     manager: JobManager,
     progress: Progress,
+    *,
+    selection: QualitySelection,
+    default_quality: str,
+    upload_mode: str,
 ) -> None:
     settings = manager.settings
     chat_id = update.effective_chat.id
@@ -280,6 +550,7 @@ async def _pipeline(
     await manager.set_status(user_id, "checking URL")
 
     use_single_engine = platforms.is_probable_hls(url) or platforms.is_probable_direct_media(url)
+    height_cap = effective_height_cap(settings.max_height, default_quality, selection)
     inspection = None
     info: dict | None = None
     title = ""
@@ -290,7 +561,9 @@ async def _pipeline(
     if use_single_engine:
         await manager.set_status(user_id, "inspecting stream")
         progress.stage = "inspecting"
-        inspection = await downloader.inspect_source(url, settings)
+        inspection = await downloader.inspect_source(
+            url, settings, None, selection=selection, max_height=height_cap
+        )
         if inspection.kind == "hls" and inspection.hls is not None:
             estimated = inspection.estimated_bytes
             duration_s = inspection.duration
@@ -329,10 +602,16 @@ async def _pipeline(
                     "The video exceeds the configured file-size limit "
                     f"({limit_mb} MB; smallest known format ~{format_bytes(smallest)})."
                 )
-        format_override = pick_format_string(info, settings.effective_max_bytes, settings.max_height)
+        format_override = pick_format_string(info, settings.effective_max_bytes, height_cap)
+        if selection.is_explicit and format_override is None:
+            raise QualityUnavailableError(
+                f"{selection.target_height}p is not available within the current limits."
+            )
         if format_override:
             logger.info("Pinned format %s for user %d", format_override, user_id)
 
+    progress.title = title or "Video"
+    progress.label = label
     storage_used = manager.disk_usage_bytes()
     if estimated and storage_used + estimated > settings.max_temp_disk_bytes:
         raise TooLargeError(
@@ -342,9 +621,20 @@ async def _pipeline(
     if not media.ffmpeg_available():
         logger.warning("FFmpeg missing; merging/remuxing may fail.")
 
-    await safe_edit(
+    await tgui.edit_card(
         status_msg,
-        f"⬇️ Downloading video…\n🎬 {title[:100]}\n⏱ {format_duration(duration_s)} | 🎞 {label}",
+        ui.status_card(
+            title=progress.title,
+            label=progress.label,
+            phase=progress.stage,
+            downloaded=progress.downloaded,
+            total=progress.total,
+            speed=progress.speed,
+            eta=progress.eta,
+            detail=f"⏱ {format_duration(duration_s)} • Ready to queue",
+            queue_position=manager.queue_position(user_id),
+            show_cancel=True,
+        ),
     )
 
     await manager.set_status(user_id, "queued")
@@ -361,6 +651,7 @@ async def _pipeline(
             inspection=inspection,
             format_override=format_override,
             headers=inspection.headers if inspection else None,
+            selection=selection,
         )
         if settings.download_timeout and settings.download_timeout > 0:
             result = await asyncio.wait_for(download_coro, timeout=settings.download_timeout)
@@ -388,6 +679,8 @@ async def _pipeline(
         duration_s = result.duration
     elif media_info is not None and media_info.duration > 0:
         duration_s = media_info.duration
+    progress.title = title or "Video"
+    progress.label = result.label or label
     logger.info(
         "Download complete | user=%d | size=%s | duration=%s | label=%s",
         user_id,
@@ -395,6 +688,27 @@ async def _pipeline(
         format_duration(duration_s),
         result.label or label,
     )
+
+    async def _milestone(text: str) -> None:
+        clean = text.strip().replace("\n", " ")
+        if len(clean) > 220:
+            clean = clean[:219].rstrip() + "…"
+        progress.detail = clean
+        await tgui.edit_card(
+            status_msg,
+            ui.status_card(
+                title=progress.title,
+                label=progress.label,
+                phase=progress.stage,
+                downloaded=progress.downloaded,
+                total=progress.total,
+                speed=progress.speed,
+                eta=progress.eta,
+                detail=clean,
+                queue_position=manager.queue_position(user_id),
+                show_cancel=True,
+            ),
+        )
 
     await manager.set_status(user_id, "uploading")
     mode, part_count = await manager.uploader.deliver(
@@ -406,10 +720,22 @@ async def _pipeline(
         duration_s=duration_s,
         size=size,
         progress=progress,
-        status_cb=lambda text: safe_edit(status_msg, text),
+        status_cb=_milestone,
+        upload_mode=upload_mode,
     )
+    try:
+        await manager.record_completion(user_id, platform.key, mode, part_count, size)
+    except Exception as exc:
+        logger.warning("Recording download stats failed for user %d: %s", user_id, type(exc).__name__)
     await manager.set_status(user_id, "completed")
-    if mode == "split":
-        await safe_edit(status_msg, f"✅ Download completed ({part_count} parts).")
-    else:
-        await safe_edit(status_msg, "✅ Download completed.")
+    await tgui.edit_card(
+        status_msg,
+        ui.completion_card(
+            file_name=os.path.basename(result.path),
+            size_bytes=size,
+            quality=result.label or label,
+            mode=mode,
+            parts=part_count,
+            support_enabled=manager.settings.support_chat_id is not None,
+        ),
+    )

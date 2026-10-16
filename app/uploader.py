@@ -92,8 +92,11 @@ class Uploader:
         size: int,
         progress: Progress,
         status_cb: StatusCallback,
+        upload_mode: str = "stream",
     ) -> tuple[str, int]:
         """Deliver ``path`` to ``chat_id``. Returns ``(mode, part_count)``."""
+        if upload_mode not in ("stream", "file"):
+            raise UploadError(f"Unsupported upload preference: {upload_mode}")
         cloud_cap = CLOUD_UPLOAD_LIMIT
         needs_large_route = size > cloud_cap and not self.settings.telegram_api_url
 
@@ -104,10 +107,12 @@ class Uploader:
 
         if needs_large_route and size <= self.settings.max_bytes:
             parts = await self._split(path, title, duration_s, status_cb)
-            await self._send_parts(bot, chat_id, parts, title, duration_hms, status_cb)
+            await self._send_parts(bot, chat_id, parts, title, duration_hms, status_cb, upload_mode)
             return "split", len(parts)
 
-        await self._send_single(bot, chat_id, path, title, duration_hms, size, duration_s, progress, status_cb)
+        await self._send_single(
+            bot, chat_id, path, title, duration_hms, size, duration_s, progress, status_cb, upload_mode
+        )
         return "single", 1
 
     async def _try_mtproto(
@@ -182,12 +187,13 @@ class Uploader:
         title: str,
         duration_hms: str,
         status_cb: StatusCallback,
+        upload_mode: str = "stream",
     ) -> None:
         total = len(parts)
         for index, part in enumerate(parts, start=1):
             await status_cb(f"📤 Uploading part {index}/{total}…\n🎬 {title[:100]}")
             caption = self._caption(title, duration_hms, os.path.getsize(part), part=(index, total))
-            await self._send_file(bot, chat_id, part, caption)
+            await self._send_file(bot, chat_id, part, caption, upload_mode=upload_mode)
             if index < total:
                 await asyncio.sleep(2)
 
@@ -202,6 +208,7 @@ class Uploader:
         duration_s: float,
         progress: Progress,
         status_cb: StatusCallback,
+        upload_mode: str = "stream",
     ) -> None:
         progress.stage = "uploading"
         progress.downloaded = 0
@@ -209,38 +216,50 @@ class Uploader:
         await status_cb(f"📤 Uploading to Telegram… ({format_bytes(size)})\n🎬 {title[:100]}")
         caption = self._caption(title, duration_hms, size)
         duration_arg = int(duration_s) if duration_s and duration_s > 0 else None
-        await self._send_file(bot, chat_id, path, caption, duration=duration_arg)
+        await self._send_file(bot, chat_id, path, caption, duration=duration_arg, upload_mode=upload_mode)
 
-    async def _send_file(self, bot, chat_id: int, path: str, caption: str, duration: int | None = None) -> None:
+    async def _send_file(
+        self,
+        bot,
+        chat_id: int,
+        path: str,
+        caption: str,
+        duration: int | None = None,
+        upload_mode: str = "stream",
+    ) -> None:
         settings = self.settings
-        try:
-            with open(path, "rb") as handle:
-                await bot.send_video(
-                    chat_id=chat_id,
-                    video=handle,
-                    caption=caption,
-                    duration=duration,
-                    supports_streaming=True,
-                    read_timeout=settings.upload_timeout,
-                    write_timeout=settings.upload_timeout,
-                    connect_timeout=settings.connect_timeout,
-                )
-        except Exception as exc:
-            logger.info("send_video failed (%s); retrying as document.", type(exc).__name__)
+        attempts = ("document", "video") if upload_mode == "file" else ("video", "document")
+        last_exc: Exception | None = None
+        for attempt in attempts:
             try:
                 with open(path, "rb") as handle:
-                    await bot.send_document(
-                        chat_id=chat_id,
-                        document=handle,
-                        caption=caption,
-                        read_timeout=settings.upload_timeout,
-                        write_timeout=settings.upload_timeout,
-                        connect_timeout=settings.connect_timeout,
-                    )
-            except Exception as document_exc:
-                raise UploadError(
-                    f"Telegram rejected the upload: {type(document_exc).__name__}"
-                ) from document_exc
+                    if attempt == "video":
+                        await bot.send_video(
+                            chat_id=chat_id,
+                            video=handle,
+                            caption=caption,
+                            duration=duration,
+                            supports_streaming=True,
+                            read_timeout=settings.upload_timeout,
+                            write_timeout=settings.upload_timeout,
+                            connect_timeout=settings.connect_timeout,
+                        )
+                    else:
+                        await bot.send_document(
+                            chat_id=chat_id,
+                            document=handle,
+                            caption=caption,
+                            read_timeout=settings.upload_timeout,
+                            write_timeout=settings.upload_timeout,
+                            connect_timeout=settings.connect_timeout,
+                        )
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.info("Telegram %s upload failed (%s); trying fallback.", attempt, type(exc).__name__)
+        raise UploadError(
+            f"Telegram rejected the upload: {type(last_exc).__name__ if last_exc else 'unknown error'}"
+        ) from last_exc
 
     @staticmethod
     def _caption(title: str, duration_hms: str, size: int, part: tuple[int, int] | None = None) -> str:

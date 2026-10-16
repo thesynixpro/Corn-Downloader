@@ -12,8 +12,11 @@ persistent polling worker (no web server needed).
 
 ## Features
 
-- Send a video URL → receive the video back in Telegram.
-- Commands: `/start`, `/help`, `/about`, `/download <url>`, `/cancel`, `/status`.
+- Send a video URL → get a video info card → pick a quality → receive the video back in Telegram.
+- Premium chat UI: branded welcome screen, inline-keyboard menus, info cards,
+  live progress bars with speed/ETA, completion screens, and friendly error screens.
+- Commands: `/start`, `/help`, `/about`, `/settings`, `/profile`,
+  `/download <url>`, `/cancel`, `/status`.
 - Three download engines with automatic fallback:
   - **Native HLS engine** for `.m3u8` URLs: master/media playlist detection,
     variant selection, separate audio renditions, AES-128 support via FFmpeg,
@@ -22,7 +25,11 @@ persistent polling worker (no web server needed).
   - **yt-dlp** for platform pages and as universal fallback.
 - Best-quality format selection inside `MAX_FILE_MB` and `MAX_VIDEO_HEIGHT`,
   MP4-preferred, merged/remuxed with FFmpeg.
-- Progress updates: percent, size, speed, ETA, segment counts.
+- Progress updates: percent, block progress bar, size, speed, ETA, segment counts.
+- Quality selection offers only genuinely available options (parsed variants or
+  known-size combined formats); explicit choices are re-validated at download time.
+- Per-user settings (default quality, upload style, progress verbosity) and
+  accurate per-user statistics, persisted in SQLite.
 - Per-user single job + global download queue with queue position reporting.
 - Temp dirs cleaned on success, failure, and cancel; stale dirs removed at boot.
 - >50 MB delivery: local Bot API server, MTProto direct upload (up to ~2 GB),
@@ -43,17 +50,22 @@ persistent polling worker (no web server needed).
 │   ├── logging_setup.py        # logging + secret redaction
 │   ├── formatting.py           # human-readable sizes/durations/progress
 │   ├── progress.py             # progress state + rate meter
+│   ├── ui.py                   # premium message templates (stdlib-only, tested)
+│   ├── tgui.py                 # Card → python-telegram-bot markup bridge
+│   ├── callbacks.py            # compact safe callback-data codec (≤64 bytes)
+│   ├── selections.py           # quality selections + height-cap logic
+│   ├── store.py                # SQLite user preferences + statistics
 │   ├── urlguard.py             # URL validation + SSRF protection
 │   ├── platforms.py            # host → platform detection, host normalization
 │   ├── hls.py                  # pure m3u8 parser + segment downloader
 │   ├── hls_download.py         # HLS engine (segments, AES-128 via FFmpeg)
-│   ├── format_select.py        # pure yt-dlp format selection
+│   ├── format_select.py        # pure yt-dlp format selection + quality options
 │   ├── downloader.py           # engine router + yt-dlp + direct HTTP
 │   ├── media.py                # ffprobe validation, remux/mux, splitting
 │   ├── net.py                  # httpx client with per-hop SSRF validation
 │   ├── uploader.py             # Bot API / MTProto / split delivery
 │   ├── jobs.py                 # job manager + download pipeline
-│   └── handlers.py             # Telegram commands/messages + wiring
+│   └── handlers.py             # commands/messages/callbacks + wiring
 ├── tests/                      # unit tests (stdlib unittest, pytest-compatible)
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -138,6 +150,8 @@ Open Telegram, message the bot, send `/start`, then paste a video URL.
 | `HLS_SEGMENT_CONCURRENCY` | no | `4` | Parallel HLS segment downloads (1–16) |
 | `HLS_REFERER` | no | empty | Optional Referer header for direct HLS/media links |
 | `HLS_USER_AGENT` | no | Chrome UA | User-Agent for the native engines |
+| `DATA_DIR` | no | `<DOWNLOAD_DIR>/bot_data` | Directory for the SQLite prefs/stats database |
+| `SUPPORT_CHAT_ID` | no | empty | Enables Feedback buttons; user feedback is forwarded here |
 | `LOG_LEVEL` | no | `INFO` | DEBUG / INFO / WARNING / ERROR / CRITICAL |
 
 ### Large files (>50 MB)
@@ -156,19 +170,21 @@ Telegram's **cloud** Bot API accepts roughly 50 MB per bot upload. Options:
 ## Usage examples
 
 ```
-/start                     → welcome + limits
-/help                      → how-to
-/download https://...      → start a download explicitly
-https://youtu.be/XXXXXXXX  → same as /download
-https://cdn.site/vod/master.m3u8   → native HLS engine (variant selection shown)
-https://cdn.site/vod/clip.mp4      → direct HTTP streaming
+/start                     → branded welcome menu (Download / Help / Settings / Profile)
+/help                      → 5-step guide + tips
+/about                     → engines, limits, and policies
+/settings                  → default quality, upload style, progress verbosity
+/profile                   → your completed downloads + data delivered
+/download https://...      → inspect the link, then pick a quality
+https://youtu.be/XXXXXXXX  → info card with genuinely available qualities
+https://cdn.site/vod/master.m3u8   → native HLS engine (parsed variant options)
 /cancel                    → cancel your active job (temp files removed)
-/status                    → current stage and queue position
+/status                    → premium status card with cancel button
 ```
 
-Status messages progress through: checking → extracting/inspecting →
-downloading (percent, speed, ETA, or segment counts) → processing →
-uploading (percent for MTProto) → completed.
+Interaction flow: send a link → info card with quality buttons → download
+starts on selection → the same message shows live progress (bar, speed, ETA)
+→ completion screen with Download Another / Main Menu buttons.
 
 ## Error handling
 
@@ -200,7 +216,8 @@ pip install -r requirements-dev.txt && pytest tests -v
 Coverage: URL/SSRF validation, filename sanitization, host allow-list,
 platform detection, m3u8 parsing (master/media/keys/byte-ranges/DRM/live),
 variant selection, segment downloading with retries/progress, format
-selection, error mapping, progress/rate metering.
+selection, quality-option building, callback codec, UI templates, SQLite
+preferences/statistics, error mapping, progress/rate metering.
 
 ## Deployment (Linux)
 

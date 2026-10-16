@@ -23,6 +23,8 @@ class Progress:
     speed: float = 0.0
     eta: float | None = None
     detail: str = ""
+    title: str = ""
+    label: str = ""
 
     def reset(self, stage: str, total: int = 0) -> None:
         self.stage = stage
