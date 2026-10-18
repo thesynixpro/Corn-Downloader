@@ -1,4 +1,4 @@
-# Universal Video Downloader Bot
+# Corn Downloader
 
 Telegram bot that downloads publicly accessible videos — platform pages via
 `yt-dlp`, direct `.m3u8` HLS playlists via a native HLS engine, direct media
@@ -226,7 +226,7 @@ preferences/statistics, error mapping, progress/rate metering.
 ```ini
 # /etc/systemd/system/uvd-bot.service
 [Unit]
-Description=Universal Video Downloader Bot
+Description=Corn Downloader
 After=network-online.target
 
 [Service]
