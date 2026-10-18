@@ -19,7 +19,7 @@ class ProgressBarTests(unittest.TestCase):
 class CardTests(unittest.TestCase):
     def test_welcome_card_has_working_menu_payloads(self):
         card = ui.welcome_card("Ada", 700)
-        self.assertIn("NOVA FETCH", card.text)
+        self.assertIn("CORN DOWNLOADER", card.text)
         self.assertIn("700", card.text)
         self.assertEqual(card.parse_mode, "HTML")
         payloads = [button.data for row in card.buttons for button in row]

@@ -14,8 +14,8 @@ from dataclasses import dataclass, field
 from . import callbacks, formatting
 from .selections import quality_label
 
-BRAND_NAME = "NOVA FETCH"
-BRAND_TAGLINE = "Your ultimate media tool"
+BRAND_NAME = "CORN DOWNLOADER"
+BRAND_TAGLINE = "Smart video and HLS toolkit"
 RULE = "━━━━━━━━━━━━━━"
 MAX_TEXT_LENGTH = 4000
 
@@ -143,7 +143,7 @@ def help_card() -> Card:
 def about_card(max_mb: int, configured_mb: int) -> Card:
     text = "\n".join(
         [
-            _head("ABOUT NOVA FETCH"),
+            _head("ABOUT CORN DOWNLOADER"),
             "",
             "• yt-dlp for platform pages.",
             "• Native HLS engine for <code>.m3u8</code> playlists.",
@@ -471,7 +471,7 @@ def completion_card(
             f"🎬 Quality: <b>{escape(quality)}</b>",
             f"⚡ Status: <b>{escape(mode_text)}</b>",
             "",
-            "Thank you for using NOVA Fetch!",
+            "Thank you for using Corn Downloader!",
         ]
     )
     rows = [
@@ -522,7 +522,7 @@ def error_card(
         "failed": "❌ DOWNLOAD FAILED",
         "unexpected": "❌ UNEXPECTED ERROR",
     }
-    lines = [_head("NOVA FETCH ASSISTANT", titles.get(kind, "❌ DOWNLOAD FAILED")), "", escape(clip(message, 700))]
+    lines = [_head("CORN DOWNLOADER", titles.get(kind, "❌ DOWNLOAD FAILED")), "", escape(clip(message, 700))]
     if detail:
         lines.extend(["", f"🔧 Detail: <code>{escape(clip(detail, 180))}</code>"])
     rows: list[tuple[Button, ...]] = []
