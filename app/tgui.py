@@ -15,10 +15,17 @@ logger = logging.getLogger("uvd_bot.tgui")
 def to_markup(card: Card) -> InlineKeyboardMarkup | None:
     if not card.buttons:
         return None
-    keyboard = [
-        [InlineKeyboardButton(text=button.label, callback_data=button.data) for button in row]
-        for row in card.buttons
-    ]
+    keyboard = []
+    for row in card.buttons:
+        rendered = []
+        for button in row:
+            if button.url:
+                rendered.append(InlineKeyboardButton(text=button.label, url=button.url))
+            else:
+                rendered.append(
+                    InlineKeyboardButton(text=button.label, callback_data=button.data)
+                )
+        keyboard.append(rendered)
     return InlineKeyboardMarkup(keyboard)
 
 

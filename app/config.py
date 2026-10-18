@@ -94,10 +94,21 @@ class Settings:
     hls_user_agent: str = DEFAULT_USER_AGENT
     data_dir: Path = field(default_factory=lambda: Path("/tmp/video_downloads/bot_data"))
     support_chat_id: int | None = None
+    hls_extract_enabled: bool = True
+    hls_extract_timeout: int = 60
+    hls_extract_max_results: int = 8
+    hls_extract_verify_limit: int = 6
+    hls_extract_page_max_mb: int = 5
+    hls_extract_concurrent: int = 3
+    hls_browser_enabled: bool = False
 
     @property
     def max_bytes(self) -> int:
         return self.max_file_mb * 1024 * 1024
+
+    @property
+    def hls_extract_page_max_bytes(self) -> int:
+        return self.hls_extract_page_max_mb * 1024 * 1024
 
     @property
     def mtproto_enabled(self) -> bool:
@@ -120,6 +131,13 @@ class Settings:
     @property
     def max_temp_disk_bytes(self) -> int:
         return self.max_temp_disk_mb * 1024 * 1024
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env_str(name)
+    if not raw:
+        return default
+    return raw.lower() in ("1", "true", "yes", "on")
 
 
 def _env_chat_id(name: str) -> int | None:
@@ -169,4 +187,11 @@ def load_settings() -> Settings:
         hls_segment_concurrency=_env_int("HLS_SEGMENT_CONCURRENCY", 4, minimum=1, maximum=16),
         hls_referer=_env_str("HLS_REFERER"),
         hls_user_agent=_env_str("HLS_USER_AGENT", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT,
+        hls_extract_enabled=_env_bool("HLS_EXTRACT_ENABLED", True),
+        hls_extract_timeout=_env_int("HLS_EXTRACT_TIMEOUT", 60, minimum=10, maximum=300),
+        hls_extract_max_results=_env_int("HLS_EXTRACT_MAX_RESULTS", 8, minimum=1, maximum=20),
+        hls_extract_verify_limit=_env_int("HLS_EXTRACT_VERIFY_LIMIT", 6, minimum=0, maximum=15),
+        hls_extract_page_max_mb=_env_int("HLS_EXTRACT_PAGE_MAX_MB", 5, minimum=1, maximum=20),
+        hls_extract_concurrent=_env_int("HLS_EXTRACT_CONCURRENT", 3, minimum=1, maximum=8),
+        hls_browser_enabled=_env_bool("HLS_BROWSER_ENABLED", False),
     )

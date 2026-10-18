@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass, field
+from typing import Sequence
 
 from . import callbacks, formatting
 from .selections import quality_label
@@ -23,7 +24,8 @@ MAX_TEXT_LENGTH = 4000
 @dataclass(frozen=True)
 class Button:
     label: str
-    data: str
+    data: str = ""
+    url: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ def welcome_card(display_name: str, max_mb: int) -> Card:
             (menu_button("📥 Download Video", "download"), menu_button("📖 How to Use", "help")),
             (menu_button("⚙️ Settings", "settings"), menu_button("👤 Profile", "profile")),
             (menu_button("🔗 Platforms", "platforms"), menu_button("ℹ️ About", "about")),
+            (menu_button("🔍 Extract HLS Links", "hls"),),
         ),
     ).clipped()
 
@@ -122,12 +125,14 @@ def help_card() -> Card:
             "<b>03</b> — 🎬 Choose a genuinely available quality.",
             "<b>04</b> — ⚡ Follow live progress.",
             "<b>05</b> — ✅ Receive your delivered file.",
+            "<b>06</b> — 🔍 Use /hls &lt;url&gt; to find HLS playlist links on a page.",
             "",
             RULE,
             "<b>💡 QUICK TIPS</b>",
             "• Use valid, publicly accessible links.",
             "• Only offered qualities are actually available.",
             "• Large files take longer and may be split.",
+            "• /hls discovers public .m3u8 links without downloading video.",
             "• Download only content you may access.",
         ]
     )
@@ -135,7 +140,7 @@ def help_card() -> Card:
         text=text,
         buttons=(
             (menu_button("🔗 Supported Platforms", "platforms"), menu_button("📥 Download", "download")),
-            (menu_button("🏠 Main Menu", "home"),),
+            (menu_button("🔍 Extract HLS Links", "hls"), menu_button("🏠 Main Menu", "home")),
         ),
     ).clipped()
 
@@ -393,6 +398,9 @@ def detection_card(
         rows.append(
             tuple(Button(choice.label, callbacks.encode("start", session_id, choice.key)) for choice in chunk)
         )
+    rows.append(
+        (Button("🔍 Find HLS Links", callbacks.encode("hls_run", session_id)),)
+    )
     rows.append((Button("❌ Cancel", callbacks.encode("flow_cancel", session_id)),))
     return Card(text="\n".join(lines), buttons=tuple(rows)).clipped()
 
@@ -494,7 +502,13 @@ def cancelled_card() -> Card:
 
 def no_active_card() -> Card:
     return Card(
-        text="\n".join([_head("NOTHING TO CANCEL"), "", "ℹ️ There is no active download for your account right now."]),
+        text="\n".join(
+            [
+                _head("NOTHING TO CANCEL"),
+                "",
+                "ℹ️ There is no active download or extraction for your account right now.",
+            ]
+        ),
         buttons=((menu_button("📥 Download", "download"), menu_button("🏠 Main Menu", "home")),),
     ).clipped()
 
@@ -563,3 +577,207 @@ def feedback_sent_card() -> Card:
 
 def choice_rows_for_test() -> tuple[str, ...]:
     return ("menu", "settings", "start", "flow_cancel", "flow_retry", "job_cancel")
+
+
+# ---------------------------------------------------------------------------
+# HLS link extractor cards
+# ---------------------------------------------------------------------------
+
+HLS_VERIFICATION_LABELS = {
+    "VERIFIED_PLAYLIST": "✅ Verified playlist (content checked)",
+    "URL_FOUND_NOT_VERIFIED": "🔍 URL Found — Playback Not Verified",
+    "ACCESS_DENIED": "🚫 Access Denied",
+    "EXPIRED_OR_INVALID": "⌛ Expired or Invalid",
+    "EXTRACTION_FAILED": "❌ Could Not Verify",
+}
+HLS_TYPE_LABELS = {"master": "Master Playlist", "media": "Media Playlist", "unknown": "Unknown"}
+_HLS_PHASES = {
+    "scanning": ("SCANNING WEBPAGE", "🌐 Fetching the public page…"),
+    "inspecting": ("INSPECTING PLAYLIST", "🔍 Fetching the playlist…"),
+    "analyzing": ("ANALYZING HTML SOURCE", "🧩 Parsing page source for stream references…"),
+    "searching": ("SEARCHING FOR HLS PLAYLISTS", "🔎 Collecting candidate .m3u8 URLs…"),
+    "verifying": ("VERIFYING PLAYLISTS", "✅ Checking discovered playlists…"),
+}
+
+
+def hls_prompt_card() -> Card:
+    text = "\n".join(
+        [
+            _head("HLS LINK EXTRACTOR", "Find public HLS playlist URLs"),
+            "",
+            "Send a webpage URL or a direct <code>.m3u8</code> link.",
+            "",
+            "<b>EXAMPLE</b>",
+            "<code>/hls https://example.com/watch/video123</code>",
+            "",
+            RULE,
+            "The bot scans public page source and browser network traffic",
+            "(when enabled) for HLS playlists, then verifies what it finds.",
+            "",
+            "🔒 Only public pages are scanned. Login-walled, DRM, CAPTCHA,",
+            "and paywalled streams are not bypassed. Not every site exposes",
+            "a detectable HLS URL.",
+        ]
+    )
+    return Card(
+        text=text,
+        buttons=((menu_button("🏠 Main Menu", "home"),),),
+    ).clipped()
+
+
+def hls_progress_card(phase: str) -> Card:
+    title, body = _HLS_PHASES.get(phase, ("WORKING", "🔄 Processing…"))
+    return Card(
+        text="\n".join(
+            [_head(title), "", body, "", RULE, "🔄 The same message updates automatically."]
+        )
+    ).clipped()
+
+
+def _hls_result_block(number: int, result) -> str:
+    lines = [
+        f"<b>Result {int(number)}</b>",
+        f"🔍 Source method: <b>{escape(result.method)}</b>",
+        f"📋 Playlist type: <b>{escape(HLS_TYPE_LABELS.get(result.playlist_type, 'Unknown'))}</b>",
+        f"✔️ Verification: <b>{escape(HLS_VERIFICATION_LABELS.get(result.status, result.status))}</b>",
+    ]
+    if result.http_status:
+        lines.append(f"🌐 HTTP status: <b>{int(result.http_status)}</b>")
+    if result.detail:
+        lines.append(f"ℹ️ {escape(clip(result.detail, 160))}")
+    url_text = escape(result.url)
+    if len(result.url) > 3500:
+        url_text = escape(result.url[:3400]) + "…"
+        lines.append("⚠️ URL is very long — use View Full URL for the complete link.")
+    lines.extend(["", f"<code>{url_text}</code>"])
+    return "\n".join(lines)
+
+
+def _paginate_hls_results(results: Sequence, *, max_per_page: int = 3, max_chars: int = 3400):
+    """Split results into pages that respect Telegram's message limit."""
+    pages: list[tuple] = []
+    current: list = []
+    size = 500
+    for result in results:
+        block = 240 + len(result.url) + len(result.detail or "")
+        if current and (len(current) >= max_per_page or size + block > max_chars):
+            pages.append(tuple(current))
+            current = []
+            size = 500
+        current.append(result)
+        size += block
+    if current:
+        pages.append(tuple(current))
+    return pages or [tuple()]
+
+
+def hls_results_card(
+    source_url: str,
+    results: Sequence,
+    page: int,
+    session_id: str,
+    *,
+    browser_note: str = "",
+) -> Card:
+    pages = _paginate_hls_results(tuple(results))
+    page = max(0, min(int(page), len(pages) - 1))
+    shown = pages[page]
+    verified_count = sum(1 for item in results if item.status == "VERIFIED_PLAYLIST")
+    status_line = "HLS URLs detected"
+    if verified_count:
+        status_line = f"HLS URLs detected ({len(results)} found, {verified_count} verified)"
+    else:
+        status_line = f"HLS URLs detected ({len(results)} found)"
+    lines = [
+        _head("HLS EXTRACTION RESULTS", "Scan complete"),
+        "",
+        f"🌐 Source: <code>{escape(clip(source_url, 300))}</code>",
+        f"📊 Status: <b>{escape(status_line)}</b>",
+        "",
+    ]
+    base_index = 0
+    for prior_page in pages[:page]:
+        base_index += len(prior_page)
+    for offset, result in enumerate(shown):
+        lines.append(_hls_result_block(base_index + offset + 1, result))
+        if offset < len(shown) - 1:
+            lines.append(RULE)
+    if browser_note:
+        lines.extend(["", f"ℹ️ {escape(clip(browser_note, 200))}"])
+    lines.extend(["", RULE, "📄 Full URLs are shown above — copy them directly."])
+    rows: list[tuple[Button, ...]] = []
+    for offset, result in enumerate(shown):
+        index = base_index + offset
+        rows.append(
+            (
+                Button("🔗 Open Playlist", url=result.url),
+                Button(
+                    f"👁 View Full URL {index + 1}",
+                    callbacks.encode("hls_view", session_id, str(index)),
+                ),
+            )
+        )
+    if len(pages) > 1:
+        nav: list[Button] = []
+        if page > 0:
+            nav.append(Button("⬅️ Prev", callbacks.encode("hls_page", session_id, str(page - 1))))
+        nav.append(Button(f"Page {page + 1}/{len(pages)}", callbacks.encode("hls_page", session_id, str(page))))
+        if page < len(pages) - 1:
+            nav.append(Button("Next ➡️", callbacks.encode("hls_page", session_id, str(page + 1))))
+        rows.append(tuple(nav))
+    rows.append(
+        (
+            Button("🔍 Extract Another", callbacks.encode("hls_again")),
+            menu_button("🏠 Main Menu", "home"),
+        )
+    )
+    return Card(text="\n".join(lines), buttons=tuple(rows)).clipped()
+
+
+def hls_error_card(kind: str, message: str, *, browser_note: str = "") -> Card:
+    titles = {
+        "invalid": "⚠️ INVALID LINK",
+        "blocked": "🛡️ LINK BLOCKED",
+        "forbidden": "🚫 ACCESS DENIED",
+        "not_found": "📄 PAGE NOT FOUND",
+        "gone": "⌛ LINK EXPIRED",
+        "rate_limited": "⏳ RATE LIMITED",
+        "server": "📡 SERVER ERROR",
+        "network": "📡 NETWORK ISSUE",
+        "timeout": "⏱️ TIMED OUT",
+        "no_results": "🔎 NO HLS STREAM FOUND",
+        "busy": "⏳ EXTRACTION IN PROGRESS",
+        "disabled": "⛔ FEATURE DISABLED",
+        "failed": "❌ EXTRACTION FAILED",
+    }
+    lines = [_head("HLS LINK EXTRACTOR", titles.get(kind, "❌ EXTRACTION FAILED")), "", escape(clip(message, 700))]
+    if browser_note:
+        lines.extend(["", f"ℹ️ {escape(clip(browser_note, 200))}"])
+    return Card(
+        text="\n".join(lines),
+        buttons=(
+            (
+                Button("🔍 Extract Another", callbacks.encode("hls_again")),
+                menu_button("🏠 Main Menu", "home"),
+            ),
+            (menu_button("📖 Help", "help"),),
+        ),
+    ).clipped()
+
+
+def hls_cancelled_card() -> Card:
+    return Card(
+        text="\n".join(
+            [
+                _head("EXTRACTION CANCELLED"),
+                "",
+                "🛑 The HLS extraction was stopped. No results were kept.",
+            ]
+        ),
+        buttons=(
+            (
+                Button("🔍 Extract Another", callbacks.encode("hls_again")),
+                menu_button("🏠 Main Menu", "home"),
+            ),
+        ),
+    ).clipped()

@@ -20,7 +20,7 @@ from pathlib import Path
 
 from telegram.ext import ContextTypes
 
-from . import downloader, errors, media, platforms, tgui, ui
+from . import downloader, errors, hls_extract, media, platforms, tgui, ui
 from .config import Settings
 from .format_select import (
     best_display_format,
@@ -75,6 +75,18 @@ class LastRequest:
 
 
 PENDING_TTL_SECONDS = 600.0
+HLS_SESSION_TTL_SECONDS = 600.0
+
+
+@dataclass
+class HlsSession:
+    """In-memory result set for one HLS extraction (never persisted)."""
+
+    id: str
+    user_id: int
+    url: str
+    results: tuple[hls_extract.HlsFound, ...]
+    created_at: float
 
 
 class JobManager:
@@ -94,6 +106,10 @@ class JobManager:
         self._reserved: set[int] = set()
         self._last_requests: dict[int, LastRequest] = {}
         self._feedback_pending: set[int] = set()
+        self._hls_sessions: dict[str, HlsSession] = {}
+        self._extractions: dict[int, asyncio.Task] = {}
+        self._extract_reserved: set[int] = set()
+        self.extract_semaphore = asyncio.Semaphore(settings.hls_extract_concurrent)
 
     async def register(self, user_id: int, task: asyncio.Task, tempdir: str) -> None:
         async with self._lock:
@@ -210,6 +226,86 @@ class JobManager:
     def is_feedback_pending(self, user_id: int) -> bool:
         return user_id in self._feedback_pending
 
+    # --- HLS extraction registry -------------------------------------------
+
+    def _prune_hls_sessions(self) -> None:
+        now = time.monotonic()
+        expired = [
+            sid
+            for sid, session in self._hls_sessions.items()
+            if now - session.created_at > HLS_SESSION_TTL_SECONDS
+        ]
+        for sid in expired:
+            self._hls_sessions.pop(sid, None)
+
+    def create_hls_session(
+        self, user_id: int, url: str, results: tuple[hls_extract.HlsFound, ...]
+    ) -> HlsSession:
+        self._prune_hls_sessions()
+        session = HlsSession(
+            id=secrets.token_hex(4),
+            user_id=user_id,
+            url=url,
+            results=results,
+            created_at=time.monotonic(),
+        )
+        self._hls_sessions[session.id] = session
+        return session
+
+    def get_hls_session(self, user_id: int, session_id: str) -> HlsSession | None:
+        self._prune_hls_sessions()
+        session = self._hls_sessions.get(session_id)
+        if session is None or session.user_id != user_id:
+            return None
+        return session
+
+    async def try_reserve_extraction(self, user_id: int) -> bool:
+        async with self._lock:
+            task = self._extractions.get(user_id)
+            if (task is not None and not task.done()) or user_id in self._extract_reserved:
+                return False
+            self._extract_reserved.add(user_id)
+            return True
+
+    async def release_extraction_reservation(self, user_id: int) -> None:
+        async with self._lock:
+            self._extract_reserved.discard(user_id)
+
+    async def register_extraction(self, user_id: int, task: asyncio.Task) -> None:
+        async with self._lock:
+            self._extractions[user_id] = task
+            self._extract_reserved.discard(user_id)
+        task.add_done_callback(
+            lambda finished: asyncio.create_task(self._forget_extraction(user_id, finished))
+        )
+
+    async def _forget_extraction(self, user_id: int, task: asyncio.Task) -> None:
+        async with self._lock:
+            if self._extractions.get(user_id) is task:
+                self._extractions.pop(user_id, None)
+        with contextlib.suppress(Exception):
+            task.exception()
+
+    async def has_active_extraction(self, user_id: int) -> bool:
+        async with self._lock:
+            task = self._extractions.get(user_id)
+        return task is not None and not task.done()
+
+    async def cancel_extraction(self, user_id: int) -> bool:
+        async with self._lock:
+            task = self._extractions.get(user_id)
+            self._extract_reserved.discard(user_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        return True
+
+    async def finish_extraction(self, user_id: int) -> None:
+        async with self._lock:
+            self._extract_reserved.discard(user_id)
+
     async def _forget(self, user_id: int, task: asyncio.Task) -> None:
         async with self._lock:
             if self._tasks.get(user_id) is task:
@@ -308,6 +404,15 @@ class JobManager:
             self._pending.clear()
             self._reserved.clear()
             self._feedback_pending.clear()
+            self._hls_sessions.clear()
+            extractions = list(self._extractions.values())
+            self._extractions.clear()
+            self._extract_reserved.clear()
+        for task in extractions:
+            task.cancel()
+        for task in extractions:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         for _uid, task in tasks:
             task.cancel()
         for _uid, task in tasks:

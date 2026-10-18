@@ -16,7 +16,15 @@ persistent polling worker (no web server needed).
 - Premium chat UI: branded welcome screen, inline-keyboard menus, info cards,
   live progress bars with speed/ETA, completion screens, and friendly error screens.
 - Commands: `/start`, `/help`, `/about`, `/settings`, `/profile`,
-  `/download <url>`, `/cancel`, `/status`.
+  `/download <url>`, `/hls <url>`, `/cancel`, `/status`.
+- **HLS link extractor** (`/hls`): scans a public page's source and (optionally)
+  browser network traffic for `.m3u8` URLs, then verifies each candidate —
+  HTTP 200 alone never counts as playable. Discovery labels: Direct M3U8 URL,
+  HTML Source, Embedded Player, JavaScript Configuration, Browser Network
+  Request, Master Playlist Reference. Verification states: Verified playlist,
+  URL Found (not verified), Access Denied, Expired or Invalid, Could Not Verify.
+  Per-user single extraction, global concurrency cap, `/cancel` support,
+  results expire after 10 minutes.
 - Three download engines with automatic fallback:
   - **Native HLS engine** for `.m3u8` URLs: master/media playlist detection,
     variant selection, separate audio renditions, AES-128 support via FFmpeg,
@@ -59,6 +67,8 @@ persistent polling worker (no web server needed).
 │   ├── platforms.py            # host → platform detection, host normalization
 │   ├── hls.py                  # pure m3u8 parser + segment downloader
 │   ├── hls_download.py         # HLS engine (segments, AES-128 via FFmpeg)
+│   ├── hls_extract.py          # HLS link extractor (page/source analysis + verification)
+│   ├── browser_extract.py      # optional Playwright network capture (opt-in)
 │   ├── format_select.py        # pure yt-dlp format selection + quality options
 │   ├── downloader.py           # engine router + yt-dlp + direct HTTP
 │   ├── media.py                # ffprobe validation, remux/mux, splitting
@@ -150,6 +160,13 @@ Open Telegram, message the bot, send `/start`, then paste a video URL.
 | `HLS_SEGMENT_CONCURRENCY` | no | `4` | Parallel HLS segment downloads (1–16) |
 | `HLS_REFERER` | no | empty | Optional Referer header for direct HLS/media links |
 | `HLS_USER_AGENT` | no | Chrome UA | User-Agent for the native engines |
+| `HLS_EXTRACT_ENABLED` | no | `true` | Enable the `/hls` link extractor |
+| `HLS_EXTRACT_TIMEOUT` | no | `60` | Whole-extraction timeout (s), +45 s extra when browser fallback is on |
+| `HLS_EXTRACT_MAX_RESULTS` | no | `8` | Max results shown per extraction |
+| `HLS_EXTRACT_VERIFY_LIMIT` | no | `6` | Max candidates fetched for verification (0 = never fetch, "URL Found" only) |
+| `HLS_EXTRACT_PAGE_MAX_MB` | no | `5` | Max page-source download size per fetch |
+| `HLS_EXTRACT_CONCURRENT` | no | `3` | Global simultaneous extractions |
+| `HLS_BROWSER_ENABLED` | no | `false` | Opt-in Playwright network capture; requires `pip install playwright && playwright install chromium` |
 | `DATA_DIR` | no | `<DOWNLOAD_DIR>/bot_data` | Directory for the SQLite prefs/stats database |
 | `SUPPORT_CHAT_ID` | no | empty | Enables Feedback buttons; user feedback is forwarded here |
 | `LOG_LEVEL` | no | `INFO` | DEBUG / INFO / WARNING / ERROR / CRITICAL |
@@ -176,6 +193,7 @@ Telegram's **cloud** Bot API accepts roughly 50 MB per bot upload. Options:
 /settings                  → default quality, upload style, progress verbosity
 /profile                   → your completed downloads + data delivered
 /download https://...      → inspect the link, then pick a quality
+/hls https://...           → scan a public page for HLS playlists + verify them
 https://youtu.be/XXXXXXXX  → info card with genuinely available qualities
 https://cdn.site/vod/master.m3u8   → native HLS engine (parsed variant options)
 /cancel                    → cancel your active job (temp files removed)
@@ -217,7 +235,9 @@ Coverage: URL/SSRF validation, filename sanitization, host allow-list,
 platform detection, m3u8 parsing (master/media/keys/byte-ranges/DRM/live),
 variant selection, segment downloading with retries/progress, format
 selection, quality-option building, callback codec, UI templates, SQLite
-preferences/statistics, error mapping, progress/rate metering.
+preferences/statistics, error mapping, progress/rate metering, HLS link
+extraction (direct/HTML/embedded-player/JS/browser discovery, verification
+states, dedup, pagination, cancellation, browser-fallback degradation).
 
 ## Deployment (Linux)
 
